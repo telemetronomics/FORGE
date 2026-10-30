@@ -1,1 +1,3554 @@
--- hi
+--[[                
+    FORGE v6.1
+    Single-file loader: fetches x64ui (CONFIG.LibraryURLs), then builds aim assist, ESP,
+    NPC/bot tracking, radar, target HUD, and the CCTV monitor.
+
+    v6.2: CCTV monitor has sharp corners, no REC/time chip, and the enemy-vision/FOV-cone
+    features are removed (aim FOV circle kept). Eye mode removed.
+
+    v6.1: CCTV and menu sections are scoped in do-blocks to stay under Luau's
+    200-active-locals limit per function ("Out of local registers").
+
+    Not tested in a Roblox client.
+    Madium docs were unreachable while writing. The Drawing, hookmetamethod and
+    request contracts follow sUNC conventions and the x64ui example.
+    The namecall hook stays installed as an inactive pass-through after unload.
+    Dex++ is third-party code and is not unloaded by FORGE.
+
+    CCTV WORLD RENDERING (ViewportFrame cannot show the live world, so it is rebuilt locally)
+      Terrain       Rebuilt from Terrain:ReadVoxels as 4-stud blocks with real material colors,
+                    water included. Approximation: no smooth slopes, no grass decoration.
+      Parts         Cloned in batches, nearest first, from GetPartBoundsInRadius.
+                    Parts with CanQuery = false are not found by that query.
+      Characters    Tracked characters are pose-synced live clones, never static ghosts.
+      Sky/lighting  Sky is cloned (ViewportFrame Sky support is unverified); sun direction,
+                    ambient and tint are mirrored. Atmosphere, fog, post-processing, particles,
+                    beams, trails, billboards, SurfaceGuis and sounds are not rendered.
+      Streaming     With StreamingEnabled only the streamed area exists to be cloned.
+      Archivable    CCTVForceArchivable briefly sets Archivable = true on non-archivable
+                    instances to clone them, then restores false.
+]]
+
+local CONFIG = {
+    WindowTitle = "FORGE",
+    ConfigFile = "forge_config.json",
+    AutoLoadConfig = false,
+    MenuKey = "RightShift",
+    AimInput = "MouseButton2",
+
+    -- Hotkey names are Enum.KeyCode names, or "None".
+    PanicKey = "End",
+    AimToggleKey = "None",
+    ESPKey = "None",
+    CCTVKey = "None",
+
+    -- Tried in order. The last entry is the upstream repo documented in the x64ui README.
+    LibraryURLs = {
+        "https://raw.githubusercontent.com/telemetronomics/x64ui/main/loader.luau",
+        "https://raw.githubusercontent.com/telemetronomics/x64ui/main/main.luau",
+        "https://raw.githubusercontent.com/territorialism/x64ui/main/loader.luau",
+    },
+
+    DexURL = "https://github.com/AZYsGithub/DexPlusPlus/releases/latest/download/out.lua",
+    DexAutoload = false,
+
+    CameraEnabled = false,
+    SilentEnabled = false,
+    SilentMethod = "ViewportPointToRay",
+
+    PlayersEnabled = true,
+    NPCEnabled = false,
+    NPCSource = "Auto", -- "Auto" = any Model with a Humanoid; "Container" = only inside NPCPath
+    NPCPath = "",
+    NPCInclude = "",    -- comma-separated name substrings, blank = any
+    NPCExclude = "",
+    NPCRequireHumanoid = true, -- false: accept Models with HumanoidRootPart or Head
+    NPCHealthAttribute = "",   -- for bots without a Humanoid
+    NPCMaxHealthAttribute = "",
+
+    TargetPart = "Head",
+    TargetPriority = "Cursor", -- "Cursor", "Distance", "Health"
+    IgnoreFriends = false,
+    IgnoreList = "",           -- comma-separated player names or display names
+    TeamCheck = false,
+    WallCheck = true,
+    ForceFieldCheck = false,
+    StickyTarget = true,
+    MouseSelection = true,
+    FovRadius = 150,
+    MaxDistance = 500,
+    Response = 12,
+    Prediction = 0,
+    SelectionRate = 20,
+
+    ShowFov = true,
+    ShowArrow = true,
+    ArrowBounce = true,
+    ArrowDeathMode = "Fade",
+    ArrowHeight = 3,
+    ArrowFadeSeconds = 0.8,
+    ArrowHoldSeconds = 0.35,
+    ArrowGlideResponse = 5,
+    HudEnabled = true,
+
+    RadarEnabled = false,
+    RadarSize = 170,
+    RadarRange = 150,
+    RadarRotate = true,
+
+    ESPEnabled = false,
+    ESPPlayers = true,
+    ESPNPCs = true,
+    ESPBox = true,
+    ESPName = true,
+    ESPDistance = true,
+    ESPHealth = true,
+    ESPTracer = false,
+    ESPSkeleton = false,
+    ESPVisibleCheck = false,
+    ESPTeamColor = true,
+    ESPHideTeammates = false,
+    ESPMaxDistance = 1500,
+    ESPTextSize = 13,
+    ESPBoxAspect = 0.55,
+    ESPOpacity = 1, -- Drawing convention: 1 = opaque, 0 = invisible
+    ESPPlayerColor = Color3.fromRGB(255, 60, 60),
+    ESPNPCColor = Color3.fromRGB(255, 170, 0),
+    ESPVisibleColor = Color3.fromRGB(80, 255, 120),
+
+    -- CCTV monitor
+    CCTVEnabled = false,
+    CCTVMode = "Behind",         -- "Behind", "Front", "Overhead", "Orbit"
+    CCTVPin = false,
+    CCTVOpenSeconds = 0.45,
+    CCTVShowSelf = true,
+    CCTVShowStatus = true,
+    CCTVDistance = 9,
+    CCTVHeight = 3.5,
+    CCTVFov = 70,
+    CCTVSmoothing = 8,
+    CCTVLostSeconds = 5,
+    CCTVBackground = Color3.fromRGB(95, 125, 165),
+
+    CCTVRadius = 250,
+    CCTVMaxParts = 1500,
+    CCTVSceneRefresh = 3,
+    CCTVForceArchivable = true,
+
+    CCTVTerrain = true,
+    CCTVTerrainRadius = 160,
+    CCTVTerrainHeight = 48,
+    CCTVTerrainMaxParts = 3000,
+    CCTVTerrainRefresh = 20,
+
+    CCTVSky = true,
+    CCTVMatchLighting = true,
+    CCTVOthers = true,
+    CCTVMaxOthers = 10,
+}
+
+local THEME = {
+    Panel = Color3.fromRGB(17, 19, 25),
+    PanelAlt = Color3.fromRGB(26, 29, 38),
+    Stroke = Color3.fromRGB(54, 60, 74),
+    Text = Color3.fromRGB(232, 235, 242),
+    Muted = Color3.fromRGB(139, 147, 164),
+    Accent = Color3.fromRGB(96, 165, 250),
+    Good = Color3.fromRGB(74, 222, 128),
+    Warn = Color3.fromRGB(250, 204, 21),
+    Bad = Color3.fromRGB(248, 113, 113),
+    Font = Enum.Font.GothamMedium,
+    FontBold = Enum.Font.GothamBold,
+}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+
+assert(RunService:IsClient(), "FORGE: client execution required")
+assert(type(getgenv) == "function", "FORGE: getgenv is required")
+
+local env = getgenv()
+assert(type(env) == "table", "FORGE: getgenv did not return a table")
+
+local localPlayer = Players.LocalPlayer
+assert(localPlayer, "FORGE: LocalPlayer unavailable")
+
+local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+    or localPlayer:WaitForChild("PlayerGui", 10)
+assert(playerGui, "FORGE: PlayerGui unavailable")
+
+local previous = env.FORGE_SESSION
+if type(previous) == "table" and type(previous.Shutdown) == "function" then
+    pcall(previous.Shutdown) -- session may come from an older script version
+end
+
+local state = {
+    alive = true,
+    windowGone = false,
+    held = false,
+    toggleAim = false,
+    target = nil,
+    targetPart = nil,
+    targetCamera = nil,
+    targetPosition = nil,
+    selectElapsed = math.huge,
+    npcRoot = nil,
+    arrow = { pos = nil, alpha = 0, rec = nil, idle = 0, gliding = false },
+    connections = {},
+}
+
+local X64UI, window, espToggle, cctvToggle, cctvModeControl, cctvPinControl
+local shutdown
+local renderName = "ForgeClient_" .. HttpService:GenerateGUID(false)
+
+local function say(text)
+    text = tostring(text)
+    if window and not state.windowGone and window.Destroyed ~= true then
+        if type(window.Log) == "function" then window:Log(text) end
+        if type(window.SetStatus) == "function" then window:SetStatus(text) end
+    else
+        warn("[FORGE] " .. text)
+    end
+end
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    state.connections[#state.connections + 1] = connection
+    return connection
+end
+
+local function disconnectList(list)
+    for _, connection in ipairs(list) do
+        connection:Disconnect()
+    end
+    table.clear(list)
+end
+
+-- Silent UI sync; SetValue's second argument is the library's no-callback flag.
+local function syncControl(control, value)
+    if type(control) == "table" and type(control.SetValue) == "function" then
+        pcall(control.SetValue, control, value, true)
+    end
+end
+
+local function hex(color)
+    return string.format(
+        "#%02x%02x%02x",
+        math.floor(color.R * 255 + 0.5),
+        math.floor(color.G * 255 + 0.5),
+        math.floor(color.B * 255 + 0.5)
+    )
+end
+
+local function esc(text)
+    return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+-- Remote loading --------------------------------------------------------
+
+local function fetch(url)
+    if type(url) ~= "string" or string.sub(url, 1, 8) ~= "https://" then
+        return nil, "invalid URL"
+    end
+
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(body) == "string" and #body > 0 then
+        return body
+    end
+
+    if type(request) == "function" then
+        local ok2, response = pcall(request, { Url = url, Method = "GET" })
+        if ok2 and type(response) == "table"
+            and type(response.Body) == "string" and #response.Body > 0
+            and (response.Success == nil or response.Success == true)
+        then
+            return response.Body
+        end
+    end
+
+    return nil, "fetch failed: " .. url
+end
+
+local function runRemote(url)
+    local source, fetchError = fetch(url)
+    if not source then
+        return false, fetchError
+    end
+    if type(loadstring) ~= "function" then
+        return false, "loadstring unavailable"
+    end
+
+    local chunk, compileError = loadstring(source)
+    if type(chunk) ~= "function" then
+        return false, compileError or "compile failed"
+    end
+
+    local ok, result = pcall(chunk)
+    if not ok then
+        return false, result
+    end
+    return true, result
+end
+
+local function validLibrary(lib)
+    return type(lib) == "table"
+        and type(lib.CreateWindow) == "function"
+        and lib._IntegrityError == nil
+end
+
+local function acquireLibrary()
+    if validLibrary(env.X64UI) then
+        return env.X64UI
+    end
+
+    local lastError = "no library URLs configured"
+    for _, url in ipairs(CONFIG.LibraryURLs) do
+        local ok, result = runRemote(url)
+        if ok then
+            if validLibrary(result) then
+                return result
+            end
+            if validLibrary(env.X64UI) then
+                return env.X64UI
+            end
+            lastError = "library did not export X64UI: " .. url
+        else
+            lastError = tostring(result)
+        end
+    end
+    return nil, lastError
+end
+
+local libraryError
+X64UI, libraryError = acquireLibrary()
+assert(X64UI, "FORGE: x64ui load failed: " .. tostring(libraryError))
+
+-- Drawing backend ---------------------------------------------------------
+
+local hasDrawing = type(Drawing) == "table" and type(Drawing.new) == "function"
+
+local function removeDrawing(object)
+    local remove = object.Remove or object.Destroy
+    if type(remove) == "function" then
+        pcall(remove, object)
+    end
+end
+
+local function destroyEsp(esp)
+    if not esp then return end
+    for index = #esp.list, 1, -1 do
+        removeDrawing(esp.list[index])
+        esp.list[index] = nil
+    end
+end
+
+local function createEsp()
+    if not hasDrawing then return nil end
+
+    local black = Color3.new(0, 0, 0)
+    local esp = { list = {}, visible = false, lastDist = -1, lastName = "" }
+
+    local function add(class, props)
+        local object = Drawing.new(class)
+        esp.list[#esp.list + 1] = object
+        for key, value in pairs(props) do
+            object[key] = value
+        end
+        return object
+    end
+
+    local ok = pcall(function()
+        esp.boxOutline = add("Square", {
+            Thickness = 3, Filled = false, Color = black, Transparency = 1, Visible = false, ZIndex = 1,
+        })
+        esp.box = add("Square", {
+            Thickness = 1, Filled = false, Transparency = 1, Visible = false, ZIndex = 2,
+        })
+        esp.hpBack = add("Square", {
+            Thickness = 1, Filled = true, Color = black, Transparency = 0.6, Visible = false, ZIndex = 2,
+        })
+        esp.hpFill = add("Square", {
+            Thickness = 1, Filled = true, Transparency = 1, Visible = false, ZIndex = 3,
+        })
+        esp.name = add("Text", {
+            Text = "", Size = 13, Center = true, Outline = true, OutlineColor = black, Visible = false, ZIndex = 4,
+        })
+        esp.dist = add("Text", {
+            Text = "", Size = 13, Center = true, Outline = true, OutlineColor = black, Visible = false, ZIndex = 4,
+        })
+        esp.tracer = add("Line", {
+            Thickness = 1, Transparency = 1, Visible = false, ZIndex = 1,
+        })
+    end)
+
+    if not ok then
+        destroyEsp(esp)
+        return nil
+    end
+    return esp
+end
+
+-- Skeleton lines are created lazily, only when the option is used.
+local function ensureSkeleton(esp)
+    if esp.skeleton then return true end
+
+    local lines = {}
+    local ok = pcall(function()
+        for index = 1, 14 do
+            local line = Drawing.new("Line")
+            esp.list[#esp.list + 1] = line
+            line.Thickness = 1
+            line.Transparency = 1
+            line.Visible = false
+            line.ZIndex = 1
+            lines[index] = line
+        end
+    end)
+
+    if not ok then return false end
+    esp.skeleton = lines
+    return true
+end
+
+local function hideEsp(esp)
+    if esp and esp.visible then
+        esp.visible = false
+        for _, object in ipairs(esp.list) do
+            object.Visible = false
+        end
+    end
+end
+
+-- Entity registry ---------------------------------------------------------
+
+local records = {}      -- [Model] = record
+local playerConns = {}  -- [Player] = { connections }
+local npcConns = {}
+local friendCache = {}  -- [UserId] = boolean
+local ignoreNames = {}  -- lowercase set
+local includeTerms, excludeTerms = {}, {}
+local npcToken = 0
+local npcDirty = true
+local lastNpcBuild = 0
+
+local function clearTarget()
+    state.target = nil
+    state.targetPart = nil
+    state.targetCamera = nil
+    state.targetPosition = nil
+end
+
+local function removeRecord(model)
+    local rec = records[model]
+    if not rec then return end
+    records[model] = nil
+    destroyEsp(rec.esp)
+    if state.target == rec then
+        clearTarget()
+    end
+end
+
+local function addRecord(model, kind, player)
+    local existing = records[model]
+    if existing then
+        if existing.kind == kind then
+            return existing
+        end
+        removeRecord(model)
+    end
+
+    local rec = {
+        model = model,
+        kind = kind,
+        player = player,
+        parts = {},
+        exact = {},
+        height = 5,
+        heightAt = -math.huge,
+        seen = false,
+    }
+    records[model] = rec
+    return rec
+end
+
+local function humanoidOf(rec)
+    local humanoid = rec.humanoid
+    if humanoid and humanoid.Parent == rec.model then
+        return humanoid
+    end
+    humanoid = rec.model:FindFirstChildOfClass("Humanoid")
+    rec.humanoid = humanoid
+    return humanoid
+end
+
+local function healthOf(rec)
+    local humanoid = humanoidOf(rec)
+    if humanoid then
+        return humanoid.Health, humanoid.MaxHealth
+    end
+
+    local attribute = CONFIG.NPCHealthAttribute
+    if rec.kind == "NPC" and attribute ~= "" then
+        local health = rec.model:GetAttribute(attribute)
+        if type(health) == "number" then
+            local maxAttribute = CONFIG.NPCMaxHealthAttribute
+            local maximum = maxAttribute ~= "" and rec.model:GetAttribute(maxAttribute) or nil
+            return health, type(maximum) == "number" and maximum or nil
+        end
+    end
+    return nil
+end
+
+local function isAlive(rec)
+    if rec.kind == "NPC" and CONFIG.NPCRequireHumanoid and not humanoidOf(rec) then
+        return false
+    end
+    local health = healthOf(rec)
+    if health then
+        return health > 0
+    end
+    return true -- no health source available; cannot prove dead
+end
+
+local FALLBACK_PARTS = { "HumanoidRootPart", "UpperTorso", "Torso", "Head" }
+
+local function partOf(rec, name)
+    local model = rec.model
+    local cached = rec.parts[name]
+    if cached and cached.Parent == model then
+        return cached
+    end
+
+    local part = model:FindFirstChild(name)
+    if not (part and part:IsA("BasePart")) then
+        part = nil
+        for _, fallback in ipairs(FALLBACK_PARTS) do
+            local candidate = model:FindFirstChild(fallback)
+            if candidate and candidate:IsA("BasePart") then
+                part = candidate
+                break
+            end
+        end
+        part = part or model.PrimaryPart
+    end
+
+    rec.parts[name] = part
+    return part
+end
+
+-- Exact-name lookup without fallbacks (skeleton joints, head).
+local function exactPart(rec, name)
+    local cached = rec.exact[name]
+    if cached and cached.Parent == rec.model then
+        return cached
+    end
+    local part = rec.model:FindFirstChild(name)
+    if part and part:IsA("BasePart") then
+        rec.exact[name] = part
+        return part
+    end
+    rec.exact[name] = nil
+    return nil
+end
+
+local function getHeight(rec, now)
+    if now - rec.heightAt > 1 then
+        rec.heightAt = now
+        rec.height = math.clamp(rec.model:GetExtentsSize().Y, 1, 40)
+    end
+    return rec.height
+end
+
+-- Ignore list / friends -----------------------------------------------------
+
+local function parseIgnore()
+    table.clear(ignoreNames)
+    if type(CONFIG.IgnoreList) ~= "string" then return end
+    for term in string.gmatch(CONFIG.IgnoreList, "[^,]+") do
+        term = string.lower(term:match("^%s*(.-)%s*$"))
+        if term ~= "" then
+            ignoreNames[term] = true
+        end
+    end
+end
+
+local function playerIgnored(player)
+    if ignoreNames[string.lower(player.Name)] or ignoreNames[string.lower(player.DisplayName)] then
+        return true
+    end
+    return CONFIG.IgnoreFriends and friendCache[player.UserId] == true
+end
+
+-- NPC / bot discovery -----------------------------------------------------
+
+local function parseTerms(text)
+    local out = {}
+    if type(text) ~= "string" then return out end
+    for term in string.gmatch(text, "[^,]+") do
+        term = string.lower(term:match("^%s*(.-)%s*$"))
+        if term ~= "" then
+            out[#out + 1] = term
+        end
+    end
+    return out
+end
+
+local function nameAllowed(name)
+    local lowered = string.lower(name)
+    for _, term in ipairs(excludeTerms) do
+        if string.find(lowered, term, 1, true) then return false end
+    end
+    if #includeTerms == 0 then return true end
+    for _, term in ipairs(includeTerms) do
+        if string.find(lowered, term, 1, true) then return true end
+    end
+    return false
+end
+
+local function npcTracking()
+    return CONFIG.NPCEnabled or (CONFIG.ESPEnabled and CONFIG.ESPNPCs)
+end
+
+local function considerNpc(model)
+    if typeof(model) ~= "Instance" or not model:IsA("Model") then return end
+    if records[model] then return end
+    if model == localPlayer.Character or Players:GetPlayerFromCharacter(model) then return end
+
+    if CONFIG.NPCSource == "Container" then
+        local root = state.npcRoot
+        if not root or not (model == root or model:IsDescendantOf(root)) then return end
+    end
+
+    if not nameAllowed(model.Name) then return end
+    addRecord(model, "NPC")
+end
+
+local function candidateModel(instance)
+    if instance.ClassName == "Humanoid" then
+        return instance.Parent
+    end
+    if not CONFIG.NPCRequireHumanoid then
+        local name = instance.Name
+        if (name == "HumanoidRootPart" or name == "Head") and instance:IsA("BasePart") then
+            return instance.Parent
+        end
+    end
+    return nil
+end
+
+local function resolvePath(path)
+    path = type(path) == "string" and path:match("^%s*(.-)%s*$") or ""
+    if path == "" then
+        return nil, "container path is empty"
+    end
+
+    local parts = string.split(path, ".")
+    local index = 1
+    if parts[index] == "game" then index += 1 end
+    if parts[index] == "Workspace" or parts[index] == "workspace" then index += 1 end
+
+    local current = Workspace
+    for i = index, #parts do
+        local child = current:FindFirstChild(parts[i])
+        if not child then
+            return nil, "not found: " .. parts[i]
+        end
+        current = child
+    end
+
+    if current == Workspace then
+        return nil, "select a container below Workspace"
+    end
+    return current
+end
+
+local function removeNpcRecords()
+    local doomed = {}
+    for model, rec in pairs(records) do
+        if rec.kind == "NPC" then
+            doomed[#doomed + 1] = model
+        end
+    end
+    for _, model in ipairs(doomed) do
+        removeRecord(model)
+    end
+end
+
+local function countKind(kind)
+    local count = 0
+    for _, rec in pairs(records) do
+        if rec.kind == kind then count += 1 end
+    end
+    return count
+end
+
+local function rebuildNpcs()
+    npcToken += 1
+    local token = npcToken
+
+    disconnectList(npcConns)
+    removeNpcRecords()
+    state.npcRoot = nil
+    includeTerms = parseTerms(CONFIG.NPCInclude)
+    excludeTerms = parseTerms(CONFIG.NPCExclude)
+
+    if not npcTracking() then return end
+
+    if CONFIG.NPCSource == "Container" then
+        local root, err = resolvePath(CONFIG.NPCPath)
+        if not root then
+            say("NPC source: " .. err)
+            return
+        end
+        state.npcRoot = root
+        npcConns[#npcConns + 1] = root.AncestryChanged:Connect(function()
+            if not root:IsDescendantOf(Workspace) then
+                npcDirty = true
+            end
+        end)
+    end
+
+    task.spawn(function()
+        local scope = state.npcRoot or Workspace
+        if state.npcRoot then
+            considerNpc(state.npcRoot)
+        end
+
+        local descendants = scope:GetDescendants()
+        for index, instance in ipairs(descendants) do
+            if token ~= npcToken or not state.alive then return end
+            local model = candidateModel(instance)
+            if model then
+                considerNpc(model)
+            end
+            if index % 3000 == 0 then
+                task.wait()
+            end
+        end
+
+        if token == npcToken then
+            say(("NPC scan complete: %d tracked"):format(countKind("NPC")))
+        end
+    end)
+end
+
+-- Reports where non-player Humanoid models live, to help fill in the container path.
+local detectBusy = false
+
+local function detectContainers()
+    if detectBusy then return end
+    detectBusy = true
+
+    task.spawn(function()
+        local counts, samples, order = {}, {}, {}
+        local descendants = Workspace:GetDescendants()
+
+        for index, instance in ipairs(descendants) do
+            if not state.alive then
+                detectBusy = false
+                return
+            end
+
+            if instance.ClassName == "Humanoid" then
+                local model = instance.Parent
+                if typeof(model) == "Instance" and model:IsA("Model")
+                    and model ~= localPlayer.Character
+                    and not Players:GetPlayerFromCharacter(model)
+                then
+                    local parent = model.Parent
+                    local key = parent and parent:GetFullName() or "nil"
+                    if not counts[key] then
+                        counts[key] = 0
+                        samples[key] = model.Name
+                        order[#order + 1] = key
+                    end
+                    counts[key] += 1
+                end
+            end
+
+            if index % 3000 == 0 then
+                task.wait()
+            end
+        end
+
+        table.sort(order, function(a, b) return counts[a] > counts[b] end)
+
+        if #order == 0 then
+            say("No non-player Humanoid models found. Try 'Require Humanoid' off.")
+        else
+            for rank = 1, math.min(#order, 5) do
+                local key = order[rank]
+                say(("%s  x%d  (e.g. %s)"):format(key, counts[key], samples[key]))
+            end
+        end
+        detectBusy = false
+    end)
+end
+
+local function trackPlayer(player)
+    if player == localPlayer or playerConns[player] then return end
+
+    local conns = {}
+    playerConns[player] = conns
+
+    local function onCharacter(character)
+        if character then
+            addRecord(character, "Player", player)
+        end
+    end
+
+    conns[1] = player.CharacterAdded:Connect(onCharacter)
+    conns[2] = player.CharacterRemoving:Connect(removeRecord)
+    onCharacter(player.Character)
+
+    task.spawn(function()
+        local ok, result = pcall(localPlayer.IsFriendsWith, localPlayer, player.UserId)
+        if ok then
+            friendCache[player.UserId] = result == true
+        end
+    end)
+end
+
+local function untrackPlayer(player)
+    local conns = playerConns[player]
+    if conns then
+        disconnectList(conns)
+        playerConns[player] = nil
+    end
+    if player.Character then
+        removeRecord(player.Character)
+    end
+end
+
+parseIgnore()
+
+for _, player in ipairs(Players:GetPlayers()) do
+    trackPlayer(player)
+end
+
+connect(Players.PlayerAdded, trackPlayer)
+connect(Players.PlayerRemoving, untrackPlayer)
+
+connect(Workspace.DescendantAdded, function(instance)
+    if not npcTracking() then return end
+    local model = candidateModel(instance)
+    if model then
+        considerNpc(model)
+    end
+end)
+
+connect(Workspace.DescendantRemoving, function(instance)
+    if records[instance] then
+        removeRecord(instance)
+    end
+end)
+
+-- Silent aim bridge (one persistent hook, shared across reruns) -----------
+
+local bridge = env.FORGE_NAMECALL_BRIDGE
+
+local function installBridge()
+    if type(bridge) == "table" and bridge.Version == 1 and bridge.Installed == true then
+        return true
+    end
+
+    local required = {
+        hookmetamethod = hookmetamethod,
+        getnamecallmethod = getnamecallmethod,
+        checkcaller = checkcaller,
+    }
+    for name, capability in pairs(required) do
+        if type(capability) ~= "function" then
+            return false, "missing executor capability: " .. name
+        end
+    end
+
+    local newBridge = {
+        Version = 1,
+        Installed = false,
+        Enabled = false,
+        Method = "ViewportPointToRay",
+        Camera = nil,
+        Position = nil,
+        Busy = setmetatable({}, { __mode = "k" }),
+    }
+
+    local original
+
+    local function wrapper(self, ...)
+        local method = getnamecallmethod()
+
+        if not newBridge.Enabled
+            or method ~= newBridge.Method
+            or self ~= newBridge.Camera
+            or checkcaller()
+        then
+            return original(self, ...)
+        end
+
+        local thread = coroutine.running()
+        if thread and newBridge.Busy[thread] then
+            return original(self, ...)
+        end
+        if thread then
+            newBridge.Busy[thread] = true
+        end
+
+        local result = table.pack(pcall(original, self, ...))
+
+        if thread then
+            newBridge.Busy[thread] = nil
+        end
+        if not result[1] then
+            error(result[2], 0)
+        end
+
+        local ray = result[2]
+        local position = newBridge.Position
+        if typeof(ray) == "Ray" and typeof(position) == "Vector3" then
+            local direction = position - ray.Origin
+            if direction.Magnitude > 0.001 then
+                result[2] = Ray.new(ray.Origin, direction.Unit * ray.Direction.Magnitude)
+            end
+        end
+
+        return table.unpack(result, 2, result.n)
+    end
+
+    local ok, hooked = pcall(hookmetamethod, game, "__namecall", wrapper)
+    if not ok then
+        return false, "hook installation failed: " .. tostring(hooked)
+    end
+    if type(hooked) ~= "function" then
+        return false, "hook returned no original function"
+    end
+
+    original = hooked
+    newBridge.Installed = true
+    bridge = newBridge
+    env.FORGE_NAMECALL_BRIDGE = newBridge
+    return true
+end
+
+local function isAiming()
+    return state.held or state.toggleAim
+end
+
+local function updateBridge()
+    if type(bridge) ~= "table" or not bridge.Installed then return end
+    bridge.Method = CONFIG.SilentMethod
+    bridge.Camera = state.targetCamera
+    bridge.Position = state.targetPosition
+    bridge.Enabled = state.alive
+        and CONFIG.SilentEnabled
+        and isAiming()
+        and state.targetCamera ~= nil
+        and state.targetPosition ~= nil
+end
+
+-- UI toolkit --------------------------------------------------------------
+
+local function newInstance(class, props, parent)
+    local object = Instance.new(class)
+    for key, value in pairs(props) do
+        object[key] = value
+    end
+    object.Parent = parent
+    return object
+end
+
+local function merge(base, extra)
+    for key, value in pairs(extra) do
+        base[key] = value
+    end
+    return base
+end
+
+-- radius: number of pixels or a UDim. Returns the UIStroke when a stroke color is given.
+local function styleFrame(frame, radius, strokeColor, strokeTransparency)
+    if radius then
+        newInstance("UICorner", {
+            CornerRadius = typeof(radius) == "UDim" and radius or UDim.new(0, radius),
+        }, frame)
+    end
+    if strokeColor then
+        return newInstance("UIStroke", {
+            Color = strokeColor,
+            Thickness = 1,
+            Transparency = strokeTransparency or 0,
+            ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        }, frame)
+    end
+    return nil
+end
+
+local function newLabel(parent, props)
+    return newInstance("TextLabel", merge({
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Font = THEME.Font,
+        Text = "",
+        TextSize = 12,
+        TextColor3 = THEME.Text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, props), parent)
+end
+
+-- Auto-sizing chip.
+local function newPill(parent, props)
+    local pill = newInstance("TextLabel", merge({
+        AutomaticSize = Enum.AutomaticSize.X,
+        Size = UDim2.fromOffset(0, 22),
+        BackgroundColor3 = THEME.Panel,
+        BackgroundTransparency = 0.1,
+        BorderSizePixel = 0,
+        Font = THEME.FontBold,
+        Text = "",
+        TextSize = 11,
+        TextColor3 = THEME.Text,
+        RichText = true,
+    }, props), parent)
+    newInstance("UIPadding", {
+        PaddingLeft = UDim.new(0, 9),
+        PaddingRight = UDim.new(0, 9),
+    }, pill)
+    local stroke = styleFrame(pill, nil, THEME.Stroke)
+    return pill, stroke
+end
+
+local function newButton(parent, props)
+    local button = newInstance("TextButton", merge({
+        BackgroundColor3 = THEME.Panel,
+        BorderSizePixel = 0,
+        Font = THEME.FontBold,
+        Text = "",
+        TextSize = 11,
+        TextColor3 = THEME.Text,
+        AutoButtonColor = true,
+    }, props), parent)
+    local stroke = styleFrame(button, nil, THEME.Stroke)
+    return button, stroke
+end
+
+local function easeOut(t)
+    return 1 - (1 - t) * (1 - t) * (1 - t)
+end
+
+-- Overlay -----------------------------------------------------------------
+
+local overlay = Instance.new("ScreenGui")
+overlay.Name = "ForgeOverlay"
+overlay.ResetOnSpawn = false
+overlay.IgnoreGuiInset = true
+overlay.ScreenInsets = Enum.ScreenInsets.None
+overlay.DisplayOrder = 100
+overlay.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+overlay.Parent = playerGui
+
+local ring = newInstance("Frame", {
+    Name = "Fov",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Visible = false,
+}, overlay)
+newInstance("UICorner", { CornerRadius = UDim.new(1, 0) }, ring)
+newInstance("UIStroke", { Color = THEME.Accent, Thickness = 1, Transparency = 0.35 }, ring)
+
+local arrow = newLabel(overlay, {
+    Name = "TargetArrow",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(32, 30),
+    Font = THEME.FontBold,
+    Text = "▼",
+    TextSize = 25,
+    TextColor3 = THEME.Bad,
+    TextStrokeColor3 = Color3.new(0, 0, 0),
+    TextXAlignment = Enum.TextXAlignment.Center,
+    Visible = false,
+})
+
+-- Target HUD
+local hud = newInstance("Frame", {
+    Name = "TargetHud",
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, 56),
+    Size = UDim2.fromOffset(268, 60),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.1,
+    BorderSizePixel = 0,
+    Visible = false,
+}, overlay)
+local hudStroke = styleFrame(hud, 10, THEME.Stroke)
+
+local hudName = newLabel(hud, {
+    Position = UDim2.fromOffset(12, 8),
+    Size = UDim2.new(1, -92, 0, 16),
+    Font = THEME.FontBold,
+    TextSize = 14,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+local hudDist = newLabel(hud, {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -12, 0, 9),
+    Size = UDim2.fromOffset(72, 14),
+    TextColor3 = THEME.Muted,
+    TextXAlignment = Enum.TextXAlignment.Right,
+})
+local hudBarBack = newInstance("Frame", {
+    Position = UDim2.fromOffset(12, 31),
+    Size = UDim2.new(1, -24, 0, 6),
+    BackgroundColor3 = THEME.PanelAlt,
+    BorderSizePixel = 0,
+}, hud)
+styleFrame(hudBarBack, 3)
+local hudBarFill = newInstance("Frame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = THEME.Good,
+    BorderSizePixel = 0,
+}, hudBarBack)
+styleFrame(hudBarFill, 3)
+local hudHp = newLabel(hud, {
+    Position = UDim2.fromOffset(12, 41),
+    Size = UDim2.new(0.5, 0, 0, 14),
+    TextColor3 = THEME.Muted,
+    TextSize = 11,
+})
+local hudBadge = newLabel(hud, {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -12, 0, 41),
+    Size = UDim2.fromOffset(130, 14),
+    Font = THEME.FontBold,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Right,
+})
+
+-- Radar
+local radarFrame = newInstance("Frame", {
+    Name = "Radar",
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.new(0, 16, 1, -16),
+    Size = UDim2.fromOffset(CONFIG.RadarSize, CONFIG.RadarSize),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.12,
+    BorderSizePixel = 0,
+    Visible = false,
+}, overlay)
+styleFrame(radarFrame, UDim.new(1, 0), THEME.Stroke)
+
+local radarInner = newInstance("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromScale(0.5, 0.5),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+}, radarFrame)
+styleFrame(radarInner, UDim.new(1, 0), THEME.Stroke, 0.5)
+
+local radarH = newInstance("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.new(1, -8, 0, 1),
+    BackgroundColor3 = THEME.Stroke,
+    BackgroundTransparency = 0.55,
+    BorderSizePixel = 0,
+}, radarFrame)
+local radarV = newInstance("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.new(0, 1, 1, -8),
+    BackgroundColor3 = THEME.Stroke,
+    BackgroundTransparency = 0.55,
+    BorderSizePixel = 0,
+}, radarFrame)
+
+local radarNorth = newLabel(radarFrame, {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(14, 14),
+    Font = THEME.FontBold,
+    Text = "N",
+    TextSize = 10,
+    TextColor3 = THEME.Muted,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    ZIndex = 2,
+})
+
+local radarSelf = newInstance("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(8, 8),
+    BackgroundColor3 = THEME.Accent,
+    BorderSizePixel = 0,
+    ZIndex = 4,
+}, radarFrame)
+styleFrame(radarSelf, UDim.new(1, 0), THEME.Panel)
+
+local radarDots = {} -- [record] = Frame
+
+-- CCTV monitor ------------------------------------------------------------
+-- Scoped in a do-block so its ~90 locals do not count toward the main chunk's
+-- 200-local limit. Names used after the block are forward-declared here.
+
+local cctv, cctvFrame, closeButton, pinButton, modeButton, drag
+local CCTV_MODES, CCTV_DEFAULT_POSITION, CCTV_DEFAULT_SIZE
+local closeCctv, switchCctv, updateCctv
+
+do
+CCTV_DEFAULT_POSITION = UDim2.fromOffset(16, 16)
+CCTV_DEFAULT_SIZE = UDim2.fromOffset(380, 270)
+local CCTV_MIN = Vector2.new(260, 190)
+local CCTV_MAX = Vector2.new(960, 700)
+CCTV_MODES = { "Behind", "Front", "Overhead", "Orbit" }
+local FULL = UDim2.fromScale(1, 1)
+
+cctv = {
+    rec = nil,
+    name = "",
+    camCF = nil,
+    dir = nil,
+    live = nil,
+    liveFor = nil,
+    selfLive = nil,
+    selfFor = nil,
+    others = {},          -- [record] = live clone
+    othersAt = 0,
+    scene = nil,
+    sceneOrigin = nil,    -- [clone] = original part (weak)
+    sceneCenter = nil,
+    sceneAt = 0,
+    sceneToken = 0,
+    sceneBusy = false,
+    terrain = nil,
+    terrainCenter = nil,
+    terrainAt = 0,
+    terrainToken = 0,
+    terrainBusy = false,
+    skyClone = nil,
+    skySource = nil,
+    envAt = -math.huge,
+    lostAt = nil,
+    statusAt = 0,
+    anim = 0,
+    closing = false,
+    dismissed = nil,
+    flash = 0,
+    titleKey = "",
+    markerKey = "",
+}
+
+cctvFrame = newInstance("Frame", {
+    Name = "CctvFeed",
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Position = CCTV_DEFAULT_POSITION,
+    Size = CCTV_DEFAULT_SIZE,
+    Visible = false,
+}, overlay)
+
+local panel = newInstance("Frame", {
+    Name = "Panel",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(2, 2),
+    BackgroundColor3 = THEME.PanelAlt,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+}, cctvFrame)
+local panelStroke = styleFrame(panel, nil, THEME.Stroke)
+
+local content = newInstance("Frame", {
+    Name = "Content",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = CCTV_DEFAULT_SIZE,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Visible = false,
+}, panel)
+
+local header = newInstance("Frame", {
+    Name = "Header",
+    Size = UDim2.new(1, 0, 0, 32),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Active = true,
+}, content)
+
+local titleLabel = newLabel(header, {
+    Position = UDim2.fromOffset(14, 0),
+    Size = UDim2.new(1, -150, 1, 0),
+    TextSize = 13,
+    RichText = true,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+
+closeButton = newButton(header, {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -8, 0.5, 0),
+    Size = UDim2.fromOffset(22, 22),
+    Text = "×",
+    TextSize = 15,
+    TextColor3 = THEME.Bad,
+})
+pinButton = newButton(header, {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -34, 0.5, 0),
+    Size = UDim2.fromOffset(34, 22),
+    Text = "PIN",
+    TextSize = 10,
+    TextColor3 = THEME.Muted,
+})
+modeButton = newButton(header, {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -72, 0.5, 0),
+    Size = UDim2.fromOffset(66, 22),
+    Text = "Behind",
+    TextSize = 10,
+})
+
+local viewArea = newInstance("Frame", {
+    Name = "View",
+    Position = UDim2.fromOffset(6, 32),
+    Size = UDim2.new(1, -12, 1, -62),
+    BackgroundColor3 = Color3.new(0, 0, 0),
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    Active = true,
+}, content)
+
+local feed = newInstance("ViewportFrame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = FULL,
+    BackgroundColor3 = CONFIG.CCTVBackground,
+    BorderSizePixel = 0,
+    Ambient = Color3.fromRGB(150, 150, 150),
+    LightColor = Color3.new(1, 1, 1),
+    LightDirection = Vector3.new(-1, -2, -1),
+    ZIndex = 1,
+}, viewArea)
+
+local feedCamera = newInstance("Camera", { FieldOfView = CONFIG.CCTVFov }, feed)
+feed.CurrentCamera = feedCamera
+
+local marker = newPill(viewArea, {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Visible = false,
+    ZIndex = 4,
+})
+
+local noSignal = newInstance("Frame", {
+    Size = FULL,
+    BackgroundColor3 = Color3.new(0, 0, 0),
+    BackgroundTransparency = 0.2,
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 6,
+}, viewArea)
+newLabel(noSignal, {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.45),
+    Size = UDim2.fromOffset(200, 24),
+    Font = THEME.FontBold,
+    Text = "NO SIGNAL",
+    TextSize = 18,
+    TextColor3 = THEME.Bad,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    ZIndex = 7,
+})
+newLabel(noSignal, {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.58),
+    Size = UDim2.fromOffset(240, 16),
+    Text = "Target lost",
+    TextColor3 = THEME.Muted,
+    TextXAlignment = Enum.TextXAlignment.Center,
+    ZIndex = 7,
+})
+
+local footer = newInstance("Frame", {
+    Name = "Footer",
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.fromScale(0, 1),
+    Size = UDim2.new(1, 0, 0, 30),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+}, content)
+
+local statusLabel = newLabel(footer, {
+    Position = UDim2.fromOffset(14, 0),
+    Size = UDim2.new(1, -40, 1, 0),
+    TextSize = 11,
+    RichText = true,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+
+local grip = newButton(footer, {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -8, 0.5, 0),
+    Size = UDim2.fromOffset(18, 18),
+    Text = "◢",
+    TextSize = 11,
+    TextColor3 = THEME.Muted,
+    AutoButtonColor = false,
+    BackgroundTransparency = 1,
+})
+
+local flashFrame = newInstance("Frame", {
+    Size = FULL,
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ZIndex = 20,
+    Active = false,
+}, panel)
+
+-- Drag and resize (`drag` is forward-declared above)
+local function beginDrag(mode)
+    return function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = {
+                mode = mode,
+                from = UserInputService:GetMouseLocation(),
+                position = cctvFrame.AbsolutePosition,
+                size = cctvFrame.AbsoluteSize,
+            }
+        end
+    end
+end
+
+connect(header.InputBegan, beginDrag("move"))
+connect(grip.InputBegan, beginDrag("size"))
+
+connect(UserInputService.InputChanged, function(input)
+    if not drag or input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+    local delta = UserInputService:GetMouseLocation() - drag.from
+    local screen = overlay.AbsoluteSize
+
+    if drag.mode == "move" then
+        local position = drag.position + delta
+        cctvFrame.Position = UDim2.fromOffset(
+            math.clamp(position.X, 0, math.max(screen.X - 60, 0)),
+            math.clamp(position.Y, 0, math.max(screen.Y - 30, 0))
+        )
+    else
+        local size = drag.size + delta
+        cctvFrame.Size = UDim2.fromOffset(
+            math.clamp(size.X, CCTV_MIN.X, CCTV_MAX.X),
+            math.clamp(size.Y, CCTV_MIN.Y, CCTV_MAX.Y)
+        )
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        drag = nil
+    end
+end)
+
+-- Cloning helpers
+local function cloneInstance(instance)
+    if instance.Archivable then
+        return instance:Clone()
+    end
+    if not CONFIG.CCTVForceArchivable then
+        return nil
+    end
+    -- Temporary client-side flag flip; restored immediately after the clone.
+    if not pcall(function() instance.Archivable = true end) then
+        return nil
+    end
+    local clone = instance:Clone()
+    pcall(function() instance.Archivable = false end)
+    return clone
+end
+
+local function stripLive(clone)
+    for _, descendant in ipairs(clone:GetDescendants()) do
+        if descendant:IsA("LuaSourceContainer") or descendant:IsA("Sound")
+            or descendant:IsA("BillboardGui") or descendant:IsA("SurfaceGui")
+            or descendant:IsA("ParticleEmitter") or descendant:IsA("Animator")
+            or descendant:IsA("ForceField")
+        then
+            descendant:Destroy()
+        elseif descendant:IsA("BasePart") then
+            descendant.Anchored = true
+            descendant.CanCollide = false
+            descendant.CanQuery = false
+            descendant.CanTouch = false
+        elseif descendant:IsA("Humanoid") then
+            descendant.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+        end
+    end
+end
+
+local function pairParts(original, clone, out)
+    local used = {}
+    for _, child in ipairs(original:GetChildren()) do
+        local match
+        for _, candidate in ipairs(clone:GetChildren()) do
+            if not used[candidate]
+                and candidate.Name == child.Name
+                and candidate.ClassName == child.ClassName
+            then
+                match = candidate
+                used[candidate] = true
+                break
+            end
+        end
+        if match then
+            if child:IsA("BasePart") then
+                out[#out + 1] = { child, match }
+            end
+            pairParts(child, match, out)
+        end
+    end
+end
+
+local function buildLive(model)
+    local wasArchivable = model.Archivable
+    model.Archivable = true
+    local clone = model:Clone()
+    model.Archivable = wasArchivable
+    if not clone then return nil end
+
+    stripLive(clone)
+    local list = {}
+    pairParts(model, clone, list)
+    clone.Parent = feed
+    return { model = clone, pairs = list }
+end
+
+local function syncLive(live)
+    if not live then return end
+    for _, pair in ipairs(live.pairs) do
+        local original = pair[1]
+        if original.Parent then
+            pair[2].CFrame = original.CFrame
+        end
+    end
+end
+
+local function destroyLive(live)
+    if live then
+        live.model:Destroy()
+    end
+end
+
+local function destroyOthers()
+    for _, live in pairs(cctv.others) do
+        destroyLive(live)
+    end
+    table.clear(cctv.others)
+end
+
+local function syncOthers(center, now)
+    if not CONFIG.CCTVOthers then
+        if next(cctv.others) then
+            destroyOthers()
+        end
+        return
+    end
+
+    if now - cctv.othersAt >= 0.5 then
+        cctv.othersAt = now
+
+        local candidates = {}
+        local radiusSquared = CONFIG.CCTVRadius * CONFIG.CCTVRadius
+        for _, rec in pairs(records) do
+            if rec ~= cctv.rec and isAlive(rec) then
+                local root = partOf(rec, "HumanoidRootPart")
+                if root then
+                    local offset = root.Position - center
+                    local distanceSquared = offset:Dot(offset)
+                    if distanceSquared <= radiusSquared then
+                        candidates[#candidates + 1] = { rec, distanceSquared }
+                    end
+                end
+            end
+        end
+        table.sort(candidates, function(a, b) return a[2] < b[2] end)
+
+        local keep = {}
+        for index = 1, math.min(#candidates, CONFIG.CCTVMaxOthers) do
+            keep[candidates[index][1]] = true
+        end
+
+        for rec, live in pairs(cctv.others) do
+            if not keep[rec] then
+                destroyLive(live)
+                cctv.others[rec] = nil
+            end
+        end
+        for rec in pairs(keep) do
+            if not cctv.others[rec] then
+                local live = buildLive(rec.model)
+                if live then
+                    cctv.others[rec] = live
+                end
+            end
+        end
+    end
+
+    for _, live in pairs(cctv.others) do
+        syncLive(live)
+    end
+end
+
+-- Static part snapshot (batched so cloning never hitches a frame)
+local function cloneScenePart(part)
+    if part.Transparency >= 0.99 or part:IsA("Terrain") then return nil end
+
+    -- Tracked characters are only ever shown as live clones, never as frozen ghosts.
+    local ancestor = part.Parent
+    while ancestor and ancestor ~= Workspace do
+        if records[ancestor] then return nil end
+        ancestor = ancestor.Parent
+    end
+
+    local clone = cloneInstance(part)
+    if not clone then return nil end
+
+    for _, child in ipairs(clone:GetChildren()) do
+        if not (child:IsA("DataModelMesh") or child:IsA("Decal") or child:IsA("Texture")
+            or child:IsA("SurfaceAppearance") or child:IsA("Light"))
+        then
+            child:Destroy()
+        end
+    end
+
+    clone.Anchored = true
+    clone.CanCollide = false
+    return clone
+end
+
+local function rebuildScene(center, targetModel)
+    cctv.sceneToken += 1
+    local token = cctv.sceneToken
+    cctv.sceneBusy = true
+    cctv.sceneCenter = center
+    cctv.sceneAt = os.clock()
+
+    local ignore = { targetModel }
+    if localPlayer.Character then
+        ignore[#ignore + 1] = localPlayer.Character
+    end
+
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignore
+    params.MaxParts = CONFIG.CCTVMaxParts * 2
+
+    local found = Workspace:GetPartBoundsInRadius(center, CONFIG.CCTVRadius, params)
+    local entries = table.create(#found)
+    for index, part in ipairs(found) do
+        local offset = part.Position - center
+        entries[index] = { part, offset:Dot(offset) }
+    end
+    table.sort(entries, function(a, b) return a[2] < b[2] end) -- nearest first
+
+    local folder = Instance.new("Folder")
+    folder.Name = "Scene"
+    local origin = setmetatable({}, { __mode = "k" })
+    local limit = math.min(#entries, CONFIG.CCTVMaxParts)
+
+    task.spawn(function()
+        for index = 1, limit do
+            if token ~= cctv.sceneToken or not state.alive then
+                folder:Destroy()
+                return
+            end
+
+            local original = entries[index][1]
+            if original.Parent then
+                local clone = cloneScenePart(original)
+                if clone then
+                    clone.Parent = folder
+                    origin[clone] = original
+                end
+            end
+
+            if index % 30 == 0 then
+                task.wait()
+            end
+        end
+
+        if token ~= cctv.sceneToken or not state.alive then
+            folder:Destroy()
+            return
+        end
+
+        local old = cctv.scene
+        cctv.scene = folder
+        cctv.sceneOrigin = origin
+        folder.Parent = feed
+        if old then old:Destroy() end
+        cctv.sceneBusy = false
+    end)
+end
+
+-- Terrain approximation (ViewportFrame cannot render Terrain itself)
+local TERRAIN_TILE = 32 -- inner voxel cells per horizontal axis per read
+local AIR, WATER = Enum.Material.Air, Enum.Material.Water
+
+local function terrainSolid(materials, occupancies, x, y, z)
+    local material = materials[x][y][z]
+    return material ~= AIR and material ~= WATER and occupancies[x][y][z] >= 0.5
+end
+
+local function buildTerrain(center)
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if not terrain then return end
+
+    cctv.terrainToken += 1
+    local token = cctv.terrainToken
+    cctv.terrainBusy = true
+    cctv.terrainCenter = center
+    cctv.terrainAt = os.clock()
+
+    local radius = CONFIG.CCTVTerrainRadius
+    local halfHeight = CONFIG.CCTVTerrainHeight
+    local totalX = math.ceil(radius * 2 / 4)
+    local totalY = math.ceil(halfHeight * 2 / 4)
+    local originX = math.floor((center.X - radius) / 4) * 4
+    local originY = math.floor((center.Y - halfHeight) / 4) * 4
+    local originZ = math.floor((center.Z - radius) / 4) * 4
+    local maxParts = CONFIG.CCTVTerrainMaxParts
+    local waterColor = terrain.WaterColor
+    local waterTransparency = math.max(terrain.WaterTransparency, 0.25)
+    local colors = {}
+
+    task.spawn(function()
+        local folder = Instance.new("Folder")
+        folder.Name = "TerrainApprox"
+
+        local count, processed = 0, 0
+        local stop = false
+
+        local function cancelled()
+            return token ~= cctv.terrainToken or not state.alive
+        end
+
+        local function emitRun(minCorner, iy, iz, startIx, length, material, height)
+            if count >= maxParts then
+                stop = true
+                return
+            end
+            count += 1
+
+            local part = Instance.new("Part")
+            part.Anchored = true
+            part.CanCollide = false
+            part.CanQuery = false
+            part.CanTouch = false
+            part.CastShadow = false
+            part.Size = Vector3.new(length * 4, 4 * height, 4)
+            part.Position = Vector3.new(
+                minCorner.X + (startIx - 2 + length * 0.5) * 4,
+                minCorner.Y + (iy - 2) * 4 + 2 * height,
+                minCorner.Z + (iz - 2) * 4 + 2
+            )
+
+            if material == WATER then
+                part.Material = Enum.Material.SmoothPlastic
+                part.Color = waterColor
+                part.Transparency = waterTransparency
+            else
+                local color = colors[material]
+                if not color then
+                    color = terrain:GetMaterialColor(material)
+                    colors[material] = color
+                end
+                part.Material = material
+                part.Color = color
+            end
+
+            part.Parent = folder
+        end
+
+        for tileX = 0, totalX - 1, TERRAIN_TILE do
+            if stop then break end
+            for tileZ = 0, totalX - 1, TERRAIN_TILE do
+                if stop then break end
+                if cancelled() then
+                    folder:Destroy()
+                    return
+                end
+
+                local innerX = math.min(TERRAIN_TILE, totalX - tileX)
+                local innerZ = math.min(TERRAIN_TILE, totalX - tileZ)
+                local minCorner = Vector3.new(originX + tileX * 4, originY, originZ + tileZ * 4)
+                -- One-cell margin on every side so edge cells can test their neighbors.
+                local region = Region3.new(
+                    minCorner - Vector3.new(4, 4, 4),
+                    minCorner + Vector3.new(innerX * 4 + 4, totalY * 4 + 4, innerZ * 4 + 4)
+                )
+
+                local ok, materials, occupancies = pcall(terrain.ReadVoxels, terrain, region, 4)
+                if ok and materials and occupancies then
+                    local sizeX, sizeY, sizeZ = innerX + 2, totalY + 2, innerZ + 2
+
+                    for iz = 2, sizeZ - 1 do
+                        if stop then break end
+                        for iy = 2, sizeY - 1 do
+                            if stop then break end
+
+                            local runMaterial, runHeight, runStart
+                            for ix = 2, sizeX do
+                                local material, height
+
+                                if ix < sizeX then
+                                    local cellMaterial = materials[ix][iy][iz]
+                                    local occupancy = occupancies[ix][iy][iz]
+
+                                    if cellMaterial ~= AIR and occupancy >= 0.05 then
+                                        local exposed
+                                        if cellMaterial == WATER then
+                                            exposed = materials[ix][iy + 1][iz] ~= WATER
+                                        else
+                                            exposed = not (
+                                                terrainSolid(materials, occupancies, ix - 1, iy, iz)
+                                                and terrainSolid(materials, occupancies, ix + 1, iy, iz)
+                                                and terrainSolid(materials, occupancies, ix, iy - 1, iz)
+                                                and terrainSolid(materials, occupancies, ix, iy + 1, iz)
+                                                and terrainSolid(materials, occupancies, ix, iy, iz - 1)
+                                                and terrainSolid(materials, occupancies, ix, iy, iz + 1)
+                                            )
+                                        end
+
+                                        if exposed then
+                                            material = cellMaterial
+                                            height = math.clamp(math.floor(occupancy * 4 + 0.5) / 4, 0.25, 1)
+                                        end
+                                    end
+                                end
+
+                                -- Greedy merge along X: same material and height share one part.
+                                if material ~= runMaterial or height ~= runHeight then
+                                    if runMaterial then
+                                        emitRun(minCorner, iy, iz, runStart, ix - runStart, runMaterial, runHeight)
+                                    end
+                                    runMaterial, runHeight, runStart = material, height, ix
+                                end
+                            end
+
+                            processed += sizeX
+                            if processed >= 8000 then
+                                processed = 0
+                                task.wait()
+                                if cancelled() then
+                                    folder:Destroy()
+                                    return
+                                end
+                            end
+                        end
+                    end
+                end
+
+                task.wait()
+            end
+        end
+
+        if cancelled() then
+            folder:Destroy()
+            return
+        end
+
+        local old = cctv.terrain
+        cctv.terrain = folder
+        folder.Parent = feed
+        if old then old:Destroy() end
+        cctv.terrainBusy = false
+    end)
+end
+
+-- Sky, lighting
+local function scaleColor(color, factor)
+    return Color3.new(
+        math.clamp(color.R * factor, 0, 1),
+        math.clamp(color.G * factor, 0, 1),
+        math.clamp(color.B * factor, 0, 1)
+    )
+end
+
+local function syncEnvironment()
+    if CONFIG.CCTVMatchLighting then
+        local sun = Lighting:GetSunDirection()
+        local daylight = sun.Y > 0
+        local direction = daylight and sun or Lighting:GetMoonDirection()
+        local strength = daylight and math.clamp(sun.Y * 3, 0.2, 1) or 0.25
+        local tint = Color3.new(1, 1, 1):Lerp(Lighting.ColorShift_Top, 0.5)
+
+        feed.LightDirection = -direction -- light travels away from the sun
+        feed.LightColor = scaleColor(tint, strength * math.clamp(Lighting.Brightness / 2, 0.4, 1.5))
+        feed.Ambient = Lighting.Ambient:Lerp(Lighting.OutdoorAmbient, 0.5)
+    end
+
+    local wanted = CONFIG.CCTVSky and Lighting:FindFirstChildOfClass("Sky") or nil
+    if wanted ~= cctv.skySource then
+        if cctv.skyClone then
+            cctv.skyClone:Destroy()
+            cctv.skyClone = nil
+        end
+        cctv.skySource = wanted
+        if wanted then
+            local clone = cloneInstance(wanted)
+            if clone then
+                clone.Parent = feed
+                cctv.skyClone = clone
+            end
+        end
+    end
+end
+
+-- CCTV lifecycle ------------------------------------------------------------
+
+local function releaseCctv()
+    cctv.sceneToken += 1
+    cctv.sceneBusy = false
+    cctv.terrainToken += 1
+    cctv.terrainBusy = false
+
+    cctv.rec = nil
+    cctv.name = ""
+    cctv.camCF = nil
+    cctv.dir = nil
+    cctv.lostAt = nil
+    cctv.liveFor = nil
+    cctv.selfFor = nil
+    cctv.sceneCenter = nil
+    cctv.terrainCenter = nil
+    cctv.skySource = nil
+    cctv.envAt = -math.huge
+    cctv.anim = 0
+    cctv.closing = false
+    cctv.flash = 0
+    cctv.titleKey = ""
+    cctv.markerKey = ""
+
+    destroyLive(cctv.live)
+    destroyLive(cctv.selfLive)
+    cctv.live, cctv.selfLive = nil, nil
+    destroyOthers()
+
+    if cctv.scene then
+        cctv.scene:Destroy()
+        cctv.scene = nil
+    end
+    cctv.sceneOrigin = nil
+
+    if cctv.terrain then
+        cctv.terrain:Destroy()
+        cctv.terrain = nil
+    end
+
+    if cctv.skyClone then
+        cctv.skyClone:Destroy()
+        cctv.skyClone = nil
+    end
+
+    feed.Size = FULL
+
+    marker.Visible = false
+    noSignal.Visible = false
+    content.Visible = false
+    cctvFrame.Visible = false
+end
+
+-- Animated close (the monitor collapses to a line, then a dot).
+function closeCctv(manual)
+    if not cctv.rec then return end
+    if manual then
+        cctv.dismissed = cctv.rec
+    end
+    cctv.closing = true
+end
+
+local function purgeFromScene(model)
+    local origin = cctv.sceneOrigin
+    if not origin then return end
+    for clone, original in pairs(origin) do
+        if original:IsDescendantOf(model) then
+            clone:Destroy()
+            origin[clone] = nil
+        end
+    end
+end
+
+-- Switching target keeps terrain, sky and your own clone; only target-specific state resets.
+function switchCctv(rec)
+    local wasOpen = cctv.anim > 0 and not cctv.closing
+
+    destroyLive(cctv.live)
+    cctv.live, cctv.liveFor = nil, nil
+    destroyOthers()
+
+    cctv.rec = rec
+    cctv.camCF = nil
+    cctv.dir = nil
+    cctv.lostAt = nil
+    cctv.closing = false
+    cctv.dismissed = nil
+    cctv.titleKey = ""
+    cctv.markerKey = ""
+    cctv.name = rec.player and rec.player.DisplayName or rec.model.Name
+
+    purgeFromScene(rec.model)
+    cctv.sceneToken += 1 -- an in-flight snapshot still contains the new target
+    cctv.sceneBusy = false
+    cctv.sceneCenter = nil
+
+    if wasOpen then
+        cctv.flash = 0.7 -- channel change
+    end
+end
+
+local function describe(rec, root)
+    local humanoid = humanoidOf(rec)
+    local velocity = root.AssemblyLinearVelocity
+    local speed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local action = "Idle"
+
+    if humanoid then
+        local humanoidState = humanoid:GetState()
+        if humanoidState == Enum.HumanoidStateType.Climbing then
+            action = "Climbing"
+        elseif humanoidState == Enum.HumanoidStateType.Swimming then
+            action = "Swimming"
+        elseif humanoid.Sit then
+            action = "Seated"
+        elseif humanoid.FloorMaterial == Enum.Material.Air then
+            action = velocity.Y > 2 and "Jumping" or "Falling"
+        elseif speed > 1 then
+            action = "Moving"
+        end
+    elseif speed > 1 then
+        action = "Moving"
+    end
+
+    local muted = hex(THEME.Muted)
+    local parts = {
+        "<b>" .. action .. "</b>",
+        ('<font color="%s">SPD</font> %d'):format(muted, math.floor(speed + 0.5)),
+    }
+
+    local health, maxHealth = healthOf(rec)
+    if health then
+        local rounded = math.floor(health + 0.5)
+        parts[#parts + 1] = maxHealth
+            and ('<font color="%s">HP</font> %d/%d'):format(muted, rounded, math.floor(maxHealth + 0.5))
+            or ('<font color="%s">HP</font> %d'):format(muted, rounded)
+    end
+
+    local tool = rec.model:FindFirstChildOfClass("Tool")
+    if tool then
+        parts[#parts + 1] = ('<font color="%s">TOOL</font> %s'):format(muted, esc(tool.Name))
+    end
+
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if animator then
+        local names = {}
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            if track.WeightCurrent > 0.3 and #names < 2 then
+                names[#names + 1] = esc(track.Name)
+            end
+        end
+        if #names > 0 then
+            parts[#parts + 1] = ('<font color="%s">ANIM</font> %s'):format(muted, table.concat(names, ", "))
+        end
+    end
+
+    return table.concat(parts, "   ")
+end
+
+local function updateMarker(effectiveFov)
+    local character = localPlayer.Character
+    local selfRoot = character and character:FindFirstChild("HumanoidRootPart")
+    local size = feed.AbsoluteSize
+
+    if not (selfRoot and selfRoot:IsA("BasePart")) or size.X < 4 or size.Y < 4 then
+        marker.Visible = false
+        return
+    end
+
+    local rel = cctv.camCF:PointToObjectSpace(selfRoot.Position + Vector3.new(0, 3.2, 0))
+    local depth = -rel.Z
+    local tanHalf = math.tan(math.rad(effectiveFov * 0.5))
+    local aspect = size.X / size.Y
+
+    local nx, ny
+    local onScreen = false
+
+    if depth > 0.1 then
+        nx = rel.X / (depth * tanHalf * aspect)
+        ny = rel.Y / (depth * tanHalf)
+        onScreen = math.abs(nx) <= 0.9 and math.abs(ny) <= 0.9
+    else
+        nx, ny = rel.X, rel.Y
+        if math.abs(nx) + math.abs(ny) < 1e-3 then
+            ny = -1
+        end
+    end
+
+    local distance = math.floor((selfRoot.Position - cctv.rec.model:GetPivot().Position).Magnitude + 0.5)
+    local muted = hex(THEME.Muted)
+    local glyph = ""
+
+    if not onScreen then
+        if math.abs(nx) > math.abs(ny) then
+            glyph = nx > 0 and "▶ " or "◀ "
+        else
+            glyph = ny > 0 and "▲ " or "▼ "
+        end
+        local scale = math.max(math.abs(nx), math.abs(ny))
+        nx = nx / scale * 0.86
+        ny = ny / scale * 0.8
+    end
+
+    local text = ('%sYOU  <font color="%s">%dm</font>'):format(glyph, muted, distance)
+    if cctv.markerKey ~= text then
+        cctv.markerKey = text
+        marker.Text = text
+    end
+
+    local origin = feed.AbsolutePosition - viewArea.AbsolutePosition
+    local yOffset = onScreen and -16 or 0
+    marker.Position = UDim2.fromOffset(
+        origin.X + (nx * 0.5 + 0.5) * size.X,
+        origin.Y + (0.5 - ny * 0.5) * size.Y + yOffset
+    )
+    marker.Visible = true
+end
+
+local function applyAnimation()
+    local full = cctvFrame.AbsoluteSize
+    local p = cctv.anim
+    local widthT = easeOut(math.clamp(p / 0.4, 0, 1))
+    local heightT = easeOut(math.clamp((p - 0.25) / 0.75, 0, 1))
+
+    panel.Size = UDim2.fromOffset(math.max(full.X * widthT, 2), math.max(full.Y * heightT, 2))
+    panel.BackgroundColor3 = Color3.new(1, 1, 1):Lerp(THEME.PanelAlt, math.clamp(heightT * 4, 0, 1))
+
+    local showContent = heightT > 0.2
+    if content.Visible ~= showContent then
+        content.Visible = showContent
+    end
+    if showContent then
+        local size = UDim2.fromOffset(full.X, full.Y)
+        if content.Size ~= size then
+            content.Size = size
+        end
+    end
+
+    local openFlash = math.clamp(1 - math.abs(p - 0.3) / 0.2, 0, 1) * 0.5
+    flashFrame.BackgroundTransparency = 1 - math.max(openFlash, cctv.flash)
+end
+
+function updateCctv(dt)
+    local now = os.clock()
+    cctv.flash = math.max(cctv.flash - dt * 2.5, 0)
+
+    local wantOpen = CONFIG.CCTVEnabled and cctv.rec ~= nil and not cctv.closing
+    local speed = 1 / math.max(CONFIG.CCTVOpenSeconds, 0.05)
+    if wantOpen then
+        cctv.anim = math.min(cctv.anim + dt * speed, 1)
+    else
+        cctv.anim = math.max(cctv.anim - dt * speed * 1.6, 0)
+    end
+
+    if cctv.anim <= 0 then
+        if cctv.rec or cctvFrame.Visible then
+            releaseCctv()
+        end
+        return
+    end
+
+    cctvFrame.Visible = true
+    applyAnimation()
+
+    local rec = cctv.rec
+    if not rec or not wantOpen then return end -- closing: the last frame stays frozen
+
+    local root = records[rec.model] == rec and isAlive(rec) and partOf(rec, "HumanoidRootPart") or nil
+    if not root then
+        cctv.lostAt = cctv.lostAt or now
+        noSignal.Visible = true
+        marker.Visible = false
+        if now - cctv.lostAt > CONFIG.CCTVLostSeconds then
+            closeCctv(false)
+        end
+        return
+    end
+
+    cctv.lostAt = nil
+    noSignal.Visible = false
+
+    -- Header
+    local mode = CONFIG.CCTVMode
+    local titleKey = cctv.name .. "|" .. mode .. "|" .. tostring(CONFIG.CCTVPin)
+    if cctv.titleKey ~= titleKey then
+        cctv.titleKey = titleKey
+        titleLabel.Text = ('<font color="%s">CAM</font>  <b>%s</b>'):format(hex(THEME.Muted), esc(cctv.name))
+        modeButton.Text = mode
+        pinButton.TextColor3 = CONFIG.CCTVPin and THEME.Accent or THEME.Muted
+    end
+
+    -- Live characters
+    if cctv.liveFor ~= rec then
+        cctv.liveFor = rec
+        destroyLive(cctv.live)
+        cctv.live = buildLive(rec.model)
+    end
+
+    local character = localPlayer.Character
+    if CONFIG.CCTVShowSelf and character then
+        if cctv.selfFor ~= character then
+            cctv.selfFor = character
+            destroyLive(cctv.selfLive)
+            cctv.selfLive = buildLive(character)
+        end
+    elseif cctv.selfLive then
+        destroyLive(cctv.selfLive)
+        cctv.selfLive, cctv.selfFor = nil, nil
+    end
+
+    syncLive(cctv.live)
+    syncLive(cctv.selfLive)
+    syncOthers(root.Position, now)
+
+    if now - cctv.envAt >= 0.5 then
+        cctv.envAt = now
+        syncEnvironment()
+    end
+
+    -- Camera
+    local look = root.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 0.01 then
+        flat = cctv.dir or Vector3.new(0, 0, -1)
+    end
+    flat = flat.Unit
+
+    if cctv.dir then
+        local blended = cctv.dir:Lerp(flat, 1 - math.exp(-6 * dt))
+        cctv.dir = blended.Magnitude > 0.05 and blended.Unit or flat
+    else
+        cctv.dir = flat
+    end
+
+    local distance, height = CONFIG.CCTVDistance, CONFIG.CCTVHeight
+    local focus = root.Position + Vector3.new(0, 1.5, 0)
+    local lift = Vector3.new(0, height, 0)
+    local desired
+    local smoothing = CONFIG.CCTVSmoothing
+
+    if mode == "Overhead" then
+        desired = CFrame.lookAt(root.Position + Vector3.new(0, distance * 2 + height, 0), focus, cctv.dir)
+    elseif mode == "Orbit" then
+        local angle = now * 0.6
+        desired = CFrame.lookAt(
+            root.Position + Vector3.new(math.cos(angle) * distance, height, math.sin(angle) * distance),
+            focus
+        )
+    elseif mode == "Front" then
+        desired = CFrame.lookAt(root.Position + cctv.dir * distance + lift, focus)
+    else
+        desired = CFrame.lookAt(root.Position - cctv.dir * distance + lift, focus)
+    end
+
+    if cctv.camCF then
+        cctv.camCF = cctv.camCF:Lerp(desired, 1 - math.exp(-smoothing * dt))
+    else
+        cctv.camCF = desired
+    end
+
+    local fovValue = CONFIG.CCTVFov
+
+    if feed.Size ~= FULL then
+        feed.Size = FULL
+    end
+
+    feedCamera.CFrame = cctv.camCF
+    feedCamera.FieldOfView = fovValue
+    feed.BackgroundColor3 = CONFIG.CCTVBackground
+
+    -- World streaming
+    if not cctv.sceneBusy and (
+        not cctv.sceneCenter
+        or (root.Position - cctv.sceneCenter).Magnitude > CONFIG.CCTVRadius * 0.35
+        or now - cctv.sceneAt > CONFIG.CCTVSceneRefresh
+    ) then
+        rebuildScene(root.Position, rec.model)
+    end
+
+    if CONFIG.CCTVTerrain then
+        if not cctv.terrainBusy and (
+            not cctv.terrainCenter
+            or (root.Position - cctv.terrainCenter).Magnitude > CONFIG.CCTVTerrainRadius * 0.4
+            or now - cctv.terrainAt > CONFIG.CCTVTerrainRefresh
+        ) then
+            buildTerrain(root.Position)
+        end
+    elseif cctv.terrain or cctv.terrainBusy then
+        cctv.terrainToken += 1
+        cctv.terrainBusy = false
+        cctv.terrainCenter = nil
+        if cctv.terrain then
+            cctv.terrain:Destroy()
+            cctv.terrain = nil
+        end
+    end
+
+    updateMarker(fovValue)
+
+    if now - cctv.statusAt > 0.2 then
+        cctv.statusAt = now
+        statusLabel.Text = CONFIG.CCTVShowStatus and describe(rec, root) or ""
+    end
+end
+
+end -- do CCTV monitor
+
+-- Aim logic ---------------------------------------------------------------
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+rayParams.RespectCanCollide = true
+
+local lastCharacter
+local exclusions = {}
+
+local function updateRayFilter()
+    local character = localPlayer.Character
+    if character == lastCharacter then return end
+    lastCharacter = character
+    table.clear(exclusions)
+    if character then
+        exclusions[1] = character
+    end
+    rayParams.FilterDescendantsInstances = exclusions
+end
+
+local function getCenter(camera)
+    if CONFIG.MouseSelection and UserInputService.MouseEnabled then
+        return UserInputService:GetMouseLocation()
+    end
+    return camera.ViewportSize * 0.5
+end
+
+local function evaluate(rec, camera, center)
+    if rec.kind == "Player" then
+        if not CONFIG.PlayersEnabled then return nil end
+        local team = localPlayer.Team
+        if CONFIG.TeamCheck and team ~= nil and rec.player.Team == team then return nil end
+        if playerIgnored(rec.player) then return nil end
+    elseif not CONFIG.NPCEnabled then
+        return nil
+    end
+
+    local model = rec.model
+    if not model:IsDescendantOf(Workspace) or not isAlive(rec) then return nil end
+
+    local part = partOf(rec, CONFIG.TargetPart)
+    if not part then return nil end
+
+    if CONFIG.ForceFieldCheck and model:FindFirstChildOfClass("ForceField") then return nil end
+
+    local origin = camera.CFrame.Position
+    local offset = part.Position - origin
+    local distance = offset.Magnitude
+    if distance > CONFIG.MaxDistance then return nil end
+
+    local point, onScreen = camera:WorldToViewportPoint(part.Position)
+    if not onScreen or point.Z <= 0 then return nil end
+
+    local dx = point.X - center.X
+    local dy = point.Y - center.Y
+    local cursorScore = dx * dx + dy * dy
+    if cursorScore > CONFIG.FovRadius * CONFIG.FovRadius then return nil end
+
+    if CONFIG.WallCheck and distance > 0.001 then
+        local hit = Workspace:Raycast(origin, offset, rayParams)
+        if hit and not hit.Instance:IsDescendantOf(model) then return nil end
+    end
+
+    local priority = CONFIG.TargetPriority
+    local score = cursorScore
+    if priority == "Distance" then
+        score = distance
+    elseif priority == "Health" then
+        local health = healthOf(rec)
+        score = (health or 1e6) + distance * 0.001
+    end
+
+    return part, score
+end
+
+local function chooseTarget(camera)
+    local center = getCenter(camera)
+    updateRayFilter()
+
+    local sticky = state.target
+    if CONFIG.StickyTarget and sticky and records[sticky.model] == sticky then
+        local part = evaluate(sticky, camera, center)
+        if part then
+            return sticky, part
+        end
+    end
+
+    local bestRec, bestPart
+    local bestScore = math.huge
+    for _, rec in pairs(records) do
+        local part, score = evaluate(rec, camera, center)
+        if part and score < bestScore then
+            bestRec, bestPart, bestScore = rec, part, score
+        end
+    end
+    return bestRec, bestPart
+end
+
+-- Line-of-sight color for ESP, throttled.
+local lastSeenAt = 0
+
+local function updateVisibility(now)
+    if not (CONFIG.ESPEnabled and CONFIG.ESPVisibleCheck) or now - lastSeenAt < 0.2 then return end
+    lastSeenAt = now
+
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+    updateRayFilter()
+
+    local origin = camera.CFrame.Position
+    for _, rec in pairs(records) do
+        local root = partOf(rec, "HumanoidRootPart")
+        if root then
+            local hit = Workspace:Raycast(origin, root.Position - origin, rayParams)
+            rec.seen = hit == nil or hit.Instance:IsDescendantOf(rec.model)
+        else
+            rec.seen = false
+        end
+    end
+end
+
+local aimType, aimKey
+
+local function resolveAim()
+    aimType, aimKey = nil, nil
+    local name = CONFIG.AimInput
+    local okType, inputType = pcall(function() return Enum.UserInputType[name] end)
+    if okType and inputType then
+        aimType = inputType
+        return
+    end
+    local okKey, keyCode = pcall(function() return Enum.KeyCode[name] end)
+    if okKey and keyCode then
+        aimKey = keyCode
+    end
+end
+
+local function isAimInput(input)
+    return (aimType ~= nil and input.UserInputType == aimType)
+        or (aimKey ~= nil and input.KeyCode == aimKey)
+end
+
+local function invalidateSelection()
+    clearTarget()
+    state.selectElapsed = math.huge
+    updateBridge()
+end
+
+-- Feature switches shared by the UI and the hotkeys
+local function setToggleAim(value)
+    state.toggleAim = value == true
+    state.selectElapsed = math.huge
+    if not isAiming() then invalidateSelection() end
+    say("Toggle aim: " .. (state.toggleAim and "ON" or "OFF"))
+end
+
+local function setEsp(value, fromUi)
+    value = value == true
+    if value and not hasDrawing then
+        CONFIG.ESPEnabled = false
+        syncControl(espToggle, false)
+        say("ESP unavailable: executor has no Drawing library")
+        return
+    end
+    CONFIG.ESPEnabled = value
+    npcDirty = true
+    if not fromUi then syncControl(espToggle, value) end
+end
+
+local function setCctv(value, fromUi)
+    CONFIG.CCTVEnabled = value == true
+    state.selectElapsed = math.huge
+    if not fromUi then syncControl(cctvToggle, CONFIG.CCTVEnabled) end
+end
+
+local hotkeys = {}
+
+local function resolveHotkeys()
+    local map = {
+        Panic = CONFIG.PanicKey,
+        Aim = CONFIG.AimToggleKey,
+        ESP = CONFIG.ESPKey,
+        CCTV = CONFIG.CCTVKey,
+    }
+    for slot, name in pairs(map) do
+        local ok, code = pcall(function() return Enum.KeyCode[name] end)
+        hotkeys[slot] = ok and code or nil
+    end
+end
+
+resolveAim()
+resolveHotkeys()
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed or UserInputService:GetFocusedTextBox() then return end
+
+    local key = input.KeyCode
+    if key ~= Enum.KeyCode.Unknown then
+        if key == hotkeys.Panic then
+            shutdown()
+            return
+        end
+        if key == hotkeys.Aim then setToggleAim(not state.toggleAim) end
+        if key == hotkeys.ESP then setEsp(not CONFIG.ESPEnabled) end
+        if key == hotkeys.CCTV then setCctv(not CONFIG.CCTVEnabled) end
+    end
+
+    if isAimInput(input) then
+        state.held = true
+        state.selectElapsed = math.huge
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if isAimInput(input) then
+        state.held = false
+        if not isAiming() then invalidateSelection() end
+    end
+end)
+
+connect(UserInputService.WindowFocusReleased, function()
+    state.held = false
+    state.toggleAim = false
+    drag = nil
+    invalidateSelection()
+end)
+
+-- Monitor header buttons
+connect(closeButton.MouseButton1Click, function()
+    closeCctv(true)
+end)
+
+connect(pinButton.MouseButton1Click, function()
+    CONFIG.CCTVPin = not CONFIG.CCTVPin
+    cctv.titleKey = ""
+    syncControl(cctvPinControl, CONFIG.CCTVPin)
+end)
+
+connect(modeButton.MouseButton1Click, function()
+    local nextIndex = 1
+    for index, name in ipairs(CCTV_MODES) do
+        if name == CONFIG.CCTVMode then
+            nextIndex = index % #CCTV_MODES + 1
+            break
+        end
+    end
+    CONFIG.CCTVMode = CCTV_MODES[nextIndex]
+    cctv.titleKey = ""
+    cctv.camCF = nil
+    syncControl(cctvModeControl, CONFIG.CCTVMode)
+end)
+
+-- Dex++ / config / diagnostics ---------------------------------------------
+
+local dexBusy = false
+
+local function loadDex()
+    if env.FORGE_DEX_LOADED == true then
+        say("Dex++ already loaded")
+        return
+    end
+    if dexBusy then return end
+    dexBusy = true
+
+    task.spawn(function()
+        local ok, err = runRemote(CONFIG.DexURL)
+        dexBusy = false
+        if ok then
+            env.FORGE_DEX_LOADED = true
+            say("Dex++ loaded")
+        else
+            say("Dex++ failed: " .. tostring(err))
+        end
+    end)
+end
+
+local function saveConfig()
+    local ok, err
+    if type(window.SaveConfig) == "function" then
+        ok, err = pcall(window.SaveConfig, window, CONFIG.ConfigFile)
+    elseif type(X64UI.SaveConfig) == "function" then
+        ok, err = pcall(X64UI.SaveConfig, X64UI)
+    else
+        ok, err = false, "no SaveConfig in library"
+    end
+    say(ok and ("Config saved: " .. CONFIG.ConfigFile) or ("Config save failed: " .. tostring(err)))
+end
+
+local function loadConfig()
+    local options = { Silent = false, FireCallbacks = true, RecordHistory = false, ApplyLayout = true }
+    local ok, err
+    if type(window.LoadConfig) == "function" then
+        ok, err = pcall(window.LoadConfig, window, CONFIG.ConfigFile, options)
+    elseif type(X64UI.LoadConfig) == "function" then
+        ok, err = pcall(X64UI.LoadConfig, X64UI, options)
+    else
+        ok, err = false, "no LoadConfig in library"
+    end
+    invalidateSelection()
+    npcDirty = true
+    say(ok and ("Config loaded: " .. CONFIG.ConfigFile) or ("Config load failed: " .. tostring(err)))
+end
+
+local CAPABILITIES = {
+    "Drawing", "hookmetamethod", "getnamecallmethod", "checkcaller", "request", "loadstring",
+    "readfile", "writefile", "isfile", "listfiles", "newcclosure", "gethui", "cloneref",
+}
+
+local function reportCapabilities()
+    local present, missing = {}, {}
+    for _, name in ipairs(CAPABILITIES) do
+        if env[name] ~= nil then
+            present[#present + 1] = name
+        else
+            missing[#missing + 1] = name
+        end
+    end
+    say("Present: " .. table.concat(present, ", "))
+    say("Missing: " .. (#missing > 0 and table.concat(missing, ", ") or "none"))
+end
+
+-- Menu --------------------------------------------------------------------
+-- Scoped in a do-block: its widget locals are not needed after construction.
+
+do
+pcall(function()
+    X64UI.MenuKeybind = Enum.KeyCode[CONFIG.MenuKey]
+end)
+
+window = X64UI:CreateWindow({
+    Name = "ForgeWindow",
+    Title = CONFIG.WindowTitle,
+    Width = 1050,
+    Height = 680,
+    SingleInstance = true,
+})
+assert(window, "FORGE: x64ui could not create a window")
+
+local function addToggle(group, id, text, key, after)
+    return group:AddToggle(id, {
+        Text = text,
+        Default = CONFIG[key],
+        Callback = function(value)
+            CONFIG[key] = value == true
+            if after then after(CONFIG[key]) end
+        end,
+    })
+end
+
+local function addSlider(group, id, text, key, minimum, maximum, rounding, suffix)
+    return group:AddSlider(id, {
+        Text = text,
+        Min = minimum,
+        Max = maximum,
+        Default = CONFIG[key],
+        Rounding = rounding or 0,
+        Suffix = suffix,
+        Callback = function(value)
+            CONFIG[key] = value
+            state.selectElapsed = math.huge
+        end,
+    })
+end
+
+local function addDropdown(group, id, text, key, values, after)
+    return group:AddDropdown(id, {
+        Text = text,
+        Values = values,
+        Default = CONFIG[key],
+        Multi = false,
+        Callback = function(value)
+            CONFIG[key] = value
+            if after then after(value) end
+        end,
+    })
+end
+
+local function addInput(group, id, text, key, placeholder, after)
+    return group:AddInput(id, {
+        Text = text,
+        Placeholder = placeholder or "",
+        Default = CONFIG[key],
+        Callback = function(value)
+            CONFIG[key] = tostring(value or "")
+            if after then after(CONFIG[key]) end
+        end,
+    })
+end
+
+local function addColor(group, id, text, key)
+    if type(group.AddColorPicker) ~= "function" then return end
+    return group:AddColorPicker(id, {
+        Text = text,
+        Default = CONFIG[key],
+        Callback = function(value)
+            CONFIG[key] = value
+        end,
+    })
+end
+
+local function markNpcDirty()
+    npcDirty = true
+end
+
+local aimTab = window:AddTab("Aim")
+local targetTab = window:AddTab("Targets")
+local espTab = window:AddTab("ESP")
+local cctvTab = window:AddTab("CCTV")
+local overlayTab = window:AddTab("Overlay")
+local settingsTab = window:AddTab("Settings")
+
+-- Aim
+local aimGroup = aimTab:AddLeftGroupbox("Targeting")
+local filterGroup = aimTab:AddLeftGroupbox("Filters")
+local tuneGroup = aimTab:AddRightGroupbox("Tuning")
+local silentGroup = aimTab:AddRightGroupbox("Viewport silent aim")
+
+addToggle(aimGroup, "forge_camera", "Camera aim", "CameraEnabled", invalidateSelection)
+addDropdown(aimGroup, "forge_aim_input", "Aim input", "AimInput",
+    { "MouseButton2", "MouseButton1", "MouseButton3", "E", "Q", "F", "LeftShift", "LeftControl", "LeftAlt", "CapsLock" },
+    resolveAim)
+addDropdown(aimGroup, "forge_part", "Target part", "TargetPart",
+    { "Head", "HumanoidRootPart", "UpperTorso", "Torso" }, invalidateSelection)
+addDropdown(aimGroup, "forge_priority", "Priority", "TargetPriority",
+    { "Cursor", "Distance", "Health" }, invalidateSelection)
+addToggle(aimGroup, "forge_sticky", "Sticky target", "StickyTarget")
+addToggle(aimGroup, "forge_mouse", "Select around cursor", "MouseSelection", invalidateSelection)
+aimGroup:AddButton({
+    Text = "Toggle aim",
+    Callback = function()
+        setToggleAim(not state.toggleAim)
+    end,
+})
+
+addToggle(filterGroup, "forge_team", "Skip teammates", "TeamCheck", invalidateSelection)
+addToggle(filterGroup, "forge_wall", "Require line of sight", "WallCheck", invalidateSelection)
+addToggle(filterGroup, "forge_ff", "Skip ForceField", "ForceFieldCheck", invalidateSelection)
+
+addSlider(tuneGroup, "forge_fov", "FOV radius", "FovRadius", 25, 600, 0, " px")
+addSlider(tuneGroup, "forge_distance", "Max distance", "MaxDistance", 25, 5000, 0, " st")
+addSlider(tuneGroup, "forge_response", "Camera response", "Response", 1, 50, 0)
+addSlider(tuneGroup, "forge_prediction", "Prediction", "Prediction", 0, 1, 2, " s")
+addSlider(tuneGroup, "forge_rate", "Selection rate", "SelectionRate", 5, 60, 0, " Hz")
+
+local silentToggle
+silentToggle = silentGroup:AddToggle("forge_silent", {
+    Text = "Silent aim",
+    Default = false,
+    Callback = function(value)
+        if value then
+            local ok, err = installBridge()
+            if not ok then
+                CONFIG.SilentEnabled = false
+                syncControl(silentToggle, false)
+                say("Silent aim unavailable: " .. tostring(err))
+                return
+            end
+        end
+        CONFIG.SilentEnabled = value == true
+        invalidateSelection()
+    end,
+})
+addDropdown(silentGroup, "forge_ray_method", "Intercept method", "SilentMethod",
+    { "ViewportPointToRay", "ScreenPointToRay" }, invalidateSelection)
+silentGroup:AddLabel("Only game-originated calls to the selected camera method are redirected.", true)
+
+-- Targets
+local playerGroup = targetTab:AddLeftGroupbox("Players")
+local npcGroup = targetTab:AddRightGroupbox("NPCs and bots")
+
+addToggle(playerGroup, "forge_players", "Target players", "PlayersEnabled", invalidateSelection)
+addToggle(playerGroup, "forge_ignore_friends", "Ignore friends", "IgnoreFriends", invalidateSelection)
+addInput(playerGroup, "forge_ignore_list", "Ignore list", "IgnoreList", "name1, name2", function()
+    parseIgnore()
+    invalidateSelection()
+end)
+
+addToggle(npcGroup, "forge_npcs", "Target NPCs and bots", "NPCEnabled", function()
+    invalidateSelection()
+    markNpcDirty()
+end)
+addDropdown(npcGroup, "forge_npc_source", "Source", "NPCSource", { "Auto", "Container" }, markNpcDirty)
+npcGroup:AddLabel("Auto tracks every non-player Model with a Humanoid. Container limits it to one path.", true)
+addInput(npcGroup, "forge_npc_path", "Container path", "NPCPath", "Workspace.Bots", markNpcDirty)
+addInput(npcGroup, "forge_npc_include", "Name contains", "NPCInclude", "bot, enemy", markNpcDirty)
+addInput(npcGroup, "forge_npc_exclude", "Name excludes", "NPCExclude", "dummy", markNpcDirty)
+addToggle(npcGroup, "forge_npc_humanoid", "Require Humanoid", "NPCRequireHumanoid", markNpcDirty)
+addInput(npcGroup, "forge_npc_hp", "Health attribute", "NPCHealthAttribute", "", markNpcDirty)
+addInput(npcGroup, "forge_npc_maxhp", "Max health attribute", "NPCMaxHealthAttribute", "", markNpcDirty)
+npcGroup:AddButton({ Text = "Rescan", Callback = markNpcDirty })
+npcGroup:AddButton({ Text = "Detect containers", Callback = detectContainers })
+
+-- ESP
+local espGroup = espTab:AddLeftGroupbox("Elements")
+local espColors = espTab:AddLeftGroupbox("Colors")
+local espStyle = espTab:AddRightGroupbox("Style")
+
+espToggle = espGroup:AddToggle("forge_esp", {
+    Text = "Enable ESP",
+    Default = false,
+    Callback = function(value)
+        setEsp(value, true)
+    end,
+})
+addToggle(espGroup, "forge_esp_players", "Players", "ESPPlayers")
+addToggle(espGroup, "forge_esp_npcs", "NPCs and bots", "ESPNPCs", markNpcDirty)
+addToggle(espGroup, "forge_esp_box", "Boxes", "ESPBox")
+addToggle(espGroup, "forge_esp_name", "Names", "ESPName")
+addToggle(espGroup, "forge_esp_dist", "Distance", "ESPDistance")
+addToggle(espGroup, "forge_esp_hp", "Health bars", "ESPHealth")
+addToggle(espGroup, "forge_esp_tracer", "Tracers", "ESPTracer")
+addToggle(espGroup, "forge_esp_skeleton", "Skeleton", "ESPSkeleton")
+
+addToggle(espColors, "forge_esp_teamcolor", "Team colors", "ESPTeamColor")
+addToggle(espColors, "forge_esp_hideteam", "Hide teammates", "ESPHideTeammates")
+addToggle(espColors, "forge_esp_visible", "Recolor when visible", "ESPVisibleCheck")
+addColor(espColors, "forge_esp_pcolor", "Player", "ESPPlayerColor")
+addColor(espColors, "forge_esp_ncolor", "NPC", "ESPNPCColor")
+addColor(espColors, "forge_esp_vcolor", "Visible", "ESPVisibleColor")
+
+addSlider(espStyle, "forge_esp_maxdist", "Max distance", "ESPMaxDistance", 50, 5000, 0, " st")
+addSlider(espStyle, "forge_esp_text", "Text size", "ESPTextSize", 10, 24, 0)
+addSlider(espStyle, "forge_esp_aspect", "Box aspect", "ESPBoxAspect", 0.3, 1, 2)
+addSlider(espStyle, "forge_esp_opacity", "Opacity", "ESPOpacity", 0.1, 1, 2)
+
+-- CCTV
+local cctvGroup = cctvTab:AddLeftGroupbox("Monitor")
+local cctvCamera = cctvTab:AddRightGroupbox("Camera")
+local worldGroup = cctvTab:AddRightGroupbox("World")
+local cctvDetail = cctvTab:AddRightGroupbox("Detail limits")
+
+cctvToggle = cctvGroup:AddToggle("forge_cctv", {
+    Text = "Enable CCTV",
+    Default = false,
+    Callback = function(value)
+        setCctv(value, true)
+    end,
+})
+cctvGroup:AddLabel("Aim at someone to power the monitor on. Drag the header to move it and the corner grip to resize it.", true)
+cctvPinControl = addToggle(cctvGroup, "forge_cctv_pin", "Pin feed", "CCTVPin", function()
+    cctv.titleKey = ""
+end)
+addToggle(cctvGroup, "forge_cctv_self", "Show my character", "CCTVShowSelf")
+addToggle(cctvGroup, "forge_cctv_status", "Status bar", "CCTVShowStatus")
+addSlider(cctvGroup, "forge_cctv_open", "Power-on time", "CCTVOpenSeconds", 0.1, 1.5, 2, " s")
+cctvGroup:AddButton({
+    Text = "Reset window",
+    Callback = function()
+        cctvFrame.Position = CCTV_DEFAULT_POSITION
+        cctvFrame.Size = CCTV_DEFAULT_SIZE
+    end,
+})
+cctvGroup:AddButton({
+    Text = "Power off",
+    Callback = function()
+        closeCctv(true)
+    end,
+})
+
+cctvModeControl = addDropdown(cctvCamera, "forge_cctv_mode", "Mode", "CCTVMode", CCTV_MODES, function()
+    cctv.titleKey = ""
+    cctv.camCF = nil
+end)
+addSlider(cctvCamera, "forge_cctv_dist", "Distance", "CCTVDistance", 3, 30, 1, " st")
+addSlider(cctvCamera, "forge_cctv_height", "Height", "CCTVHeight", 0, 15, 1, " st")
+addSlider(cctvCamera, "forge_cctv_fov", "Field of view", "CCTVFov", 30, 100, 0, "°")
+addSlider(cctvCamera, "forge_cctv_smooth", "Smoothing", "CCTVSmoothing", 1, 20, 0)
+addColor(cctvCamera, "forge_cctv_bg", "Background", "CCTVBackground")
+
+addToggle(worldGroup, "forge_cctv_terrain", "Terrain (voxel approximation)", "CCTVTerrain")
+addToggle(worldGroup, "forge_cctv_sky", "Skybox", "CCTVSky", function()
+    cctv.envAt = -math.huge
+end)
+addToggle(worldGroup, "forge_cctv_light", "Match lighting", "CCTVMatchLighting")
+addToggle(worldGroup, "forge_cctv_others", "Other characters (live)", "CCTVOthers")
+addToggle(worldGroup, "forge_cctv_archivable", "Clone non-archivable", "CCTVForceArchivable")
+worldGroup:AddButton({
+    Text = "Rebuild world",
+    Callback = function()
+        cctv.sceneCenter = nil
+        cctv.terrainCenter = nil
+    end,
+})
+
+addSlider(cctvDetail, "forge_cctv_radius", "Part radius", "CCTVRadius", 50, 600, 0, " st")
+addSlider(cctvDetail, "forge_cctv_parts", "Max parts", "CCTVMaxParts", 100, 4000, 0)
+addSlider(cctvDetail, "forge_cctv_refresh", "Part refresh", "CCTVSceneRefresh", 1, 10, 0, " s")
+addSlider(cctvDetail, "forge_cctv_trad", "Terrain radius", "CCTVTerrainRadius", 64, 400, 0, " st")
+addSlider(cctvDetail, "forge_cctv_theight", "Terrain half-height", "CCTVTerrainHeight", 16, 128, 0, " st")
+addSlider(cctvDetail, "forge_cctv_tparts", "Terrain max parts", "CCTVTerrainMaxParts", 500, 8000, 0)
+addSlider(cctvDetail, "forge_cctv_trefresh", "Terrain refresh", "CCTVTerrainRefresh", 5, 120, 0, " s")
+addSlider(cctvDetail, "forge_cctv_maxothers", "Max live characters", "CCTVMaxOthers", 0, 30, 0)
+
+-- Overlay
+local indicatorGroup = overlayTab:AddLeftGroupbox("Indicators")
+local radarGroup = overlayTab:AddRightGroupbox("Radar")
+addToggle(indicatorGroup, "forge_show_fov", "Aim FOV circle", "ShowFov")
+addToggle(indicatorGroup, "forge_show_arrow", "Target arrow", "ShowArrow")
+addToggle(indicatorGroup, "forge_bounce", "Arrow bounce", "ArrowBounce")
+addToggle(indicatorGroup, "forge_hud", "Target card", "HudEnabled")
+addDropdown(indicatorGroup, "forge_arrow_death", "On target loss", "ArrowDeathMode", { "Fade", "Glide to next" })
+addSlider(indicatorGroup, "forge_arrow_height", "Arrow height", "ArrowHeight", 1, 10, 1, " st")
+
+addToggle(radarGroup, "forge_radar", "Enable radar", "RadarEnabled")
+addToggle(radarGroup, "forge_radar_rotate", "Rotate with camera", "RadarRotate")
+addSlider(radarGroup, "forge_radar_size", "Size", "RadarSize", 110, 300, 0, " px")
+addSlider(radarGroup, "forge_radar_range", "Range", "RadarRange", 50, 1000, 0, " st")
+
+-- Settings
+local configGroup = settingsTab:AddLeftGroupbox("Profile")
+local hotkeyGroup = settingsTab:AddLeftGroupbox("Hotkeys")
+local toolsGroup = settingsTab:AddRightGroupbox("Tools")
+
+configGroup:AddKeyPicker("forge_menukey", {
+    Text = "Menu key",
+    Default = CONFIG.MenuKey,
+    Callback = function(value)
+        local ok, keyCode = pcall(function() return Enum.KeyCode[value] end)
+        if ok and keyCode then
+            X64UI.MenuKeybind = keyCode
+            CONFIG.MenuKey = value
+        end
+    end,
+})
+addInput(configGroup, "forge_cfg_file", "File name", "ConfigFile", "forge_config.json", function(value)
+    local clean = (value:gsub("[^%w_%-%.]", ""))
+    if clean == "" then
+        clean = "forge_config.json"
+    elseif not string.find(clean, "%.json$") then
+        clean = clean .. ".json"
+    end
+    CONFIG.ConfigFile = clean
+end)
+configGroup:AddButton({ Text = "Save", Callback = saveConfig })
+configGroup:AddButton({ Text = "Load", Callback = loadConfig })
+
+local HOTKEY_VALUES = {
+    "None", "End", "Delete", "Insert", "Home", "PageUp", "PageDown",
+    "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+}
+addDropdown(hotkeyGroup, "forge_hk_panic", "Panic (unload)", "PanicKey", HOTKEY_VALUES, resolveHotkeys)
+addDropdown(hotkeyGroup, "forge_hk_aim", "Toggle aim", "AimToggleKey", HOTKEY_VALUES, resolveHotkeys)
+addDropdown(hotkeyGroup, "forge_hk_esp", "Toggle ESP", "ESPKey", HOTKEY_VALUES, resolveHotkeys)
+addDropdown(hotkeyGroup, "forge_hk_cctv", "Toggle CCTV", "CCTVKey", HOTKEY_VALUES, resolveHotkeys)
+
+toolsGroup:AddLabel("Dex++ runs third-party code from CONFIG.DexURL.", true)
+addToggle(toolsGroup, "forge_dex_auto", "Autoload Dex++", "DexAutoload")
+toolsGroup:AddButton({ Text = "Load Dex++", Callback = loadDex })
+toolsGroup:AddButton({ Text = "Capability report", Callback = reportCapabilities })
+toolsGroup:AddButton({ Text = "Unload FORGE", Callback = function() shutdown() end })
+end -- do menu
+
+-- Frame loops -------------------------------------------------------------
+
+connect(RunService.Heartbeat, function(dt)
+    if not state.alive then return end
+
+    -- Opportunistic read; harmless if the library does not expose the field.
+    if window.Destroyed == true then
+        state.windowGone = true
+        shutdown()
+        return
+    end
+
+    if npcDirty and os.clock() - lastNpcBuild > 0.25 then
+        npcDirty = false
+        lastNpcBuild = os.clock()
+        rebuildNpcs()
+    end
+
+    updateVisibility(os.clock())
+
+    local camera = Workspace.CurrentCamera
+    if not camera or not isAiming()
+        or (not CONFIG.CameraEnabled and not CONFIG.SilentEnabled and not CONFIG.CCTVEnabled)
+    then
+        clearTarget()
+        cctv.dismissed = nil
+        updateBridge()
+        return
+    end
+
+    if state.targetCamera and state.targetCamera ~= camera then
+        clearTarget()
+        state.selectElapsed = math.huge
+    end
+
+    state.selectElapsed += dt
+    if state.selectElapsed >= 1 / math.max(CONFIG.SelectionRate, 1) then
+        state.selectElapsed = 0
+        local rec, part = chooseTarget(camera)
+        state.target = rec
+        state.targetPart = part
+        state.targetCamera = rec and camera or nil
+    end
+
+    local rec, part = state.target, state.targetPart
+    if rec and part and part.Parent == rec.model and records[rec.model] == rec and isAlive(rec) then
+        state.targetPosition = part.Position + part.AssemblyLinearVelocity * CONFIG.Prediction
+    else
+        clearTarget()
+        state.selectElapsed = math.huge
+    end
+
+    -- The monitor follows the aimed target and switches on a new one, unless pinned or dismissed.
+    local aimed = state.target
+    if aimed ~= cctv.dismissed then
+        cctv.dismissed = nil
+    end
+    if CONFIG.CCTVEnabled and aimed and aimed ~= cctv.dismissed then
+        local pinned = CONFIG.CCTVPin and cctv.rec ~= nil and not cctv.closing
+        if (cctv.rec ~= aimed or cctv.closing) and not pinned then
+            switchCctv(aimed)
+        end
+    end
+
+    updateBridge()
+end)
+
+local function updateArrow(dt, camera, valid)
+    local a = state.arrow
+
+    if valid then
+        local desired = state.targetPart.Position + Vector3.new(0, CONFIG.ArrowHeight, 0)
+        if a.rec ~= state.target then
+            if a.pos and a.alpha > 0 and CONFIG.ArrowDeathMode == "Glide to next" then
+                a.gliding = true
+            else
+                a.pos = desired
+                a.gliding = false
+            end
+            a.rec = state.target
+        end
+
+        a.idle = 0
+        a.alpha = 1
+
+        if a.gliding then
+            local k = 1 - math.exp(-CONFIG.ArrowGlideResponse * dt)
+            a.pos = a.pos:Lerp(desired, k)
+            if (a.pos - desired).Magnitude < 0.1 then
+                a.gliding = false
+            end
+        else
+            a.pos = desired
+        end
+    else
+        a.rec = nil
+        a.gliding = false
+        if a.pos then
+            a.idle += dt
+            local hold = CONFIG.ArrowDeathMode == "Glide to next" and CONFIG.ArrowHoldSeconds or 0
+            local fadeTime = a.idle - hold
+            if fadeTime <= 0 then
+                a.alpha = 1
+            else
+                a.alpha = math.clamp(1 - fadeTime / math.max(CONFIG.ArrowFadeSeconds, 0.01), 0, 1)
+            end
+            if a.alpha <= 0 then
+                a.pos = nil
+            end
+        end
+    end
+
+    if not CONFIG.ShowArrow or not a.pos then
+        arrow.Visible = false
+        return
+    end
+
+    local position = a.pos
+    if CONFIG.ArrowBounce then
+        position += Vector3.new(0, math.sin(os.clock() * 5) * 0.35, 0)
+    end
+
+    local point, onScreen = camera:WorldToViewportPoint(position)
+    arrow.Visible = onScreen and point.Z > 0
+    if arrow.Visible then
+        arrow.Position = UDim2.fromOffset(point.X, point.Y)
+        arrow.TextTransparency = 1 - a.alpha
+        arrow.TextStrokeTransparency = 1 - a.alpha * 0.75
+    end
+end
+
+local function entityColor(rec)
+    if CONFIG.ESPVisibleCheck and rec.seen then
+        return CONFIG.ESPVisibleColor
+    end
+    if rec.kind == "Player" then
+        if CONFIG.ESPTeamColor and rec.player.Team then
+            return rec.player.TeamColor.Color
+        end
+        return CONFIG.ESPPlayerColor
+    end
+    return CONFIG.ESPNPCColor
+end
+
+local R15_RIG = {
+    { "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
+    { "UpperTorso", "LeftUpperArm" }, { "LeftUpperArm", "LeftLowerArm" }, { "LeftLowerArm", "LeftHand" },
+    { "UpperTorso", "RightUpperArm" }, { "RightUpperArm", "RightLowerArm" }, { "RightLowerArm", "RightHand" },
+    { "LowerTorso", "LeftUpperLeg" }, { "LeftUpperLeg", "LeftLowerLeg" }, { "LeftLowerLeg", "LeftFoot" },
+    { "LowerTorso", "RightUpperLeg" }, { "RightUpperLeg", "RightLowerLeg" }, { "RightLowerLeg", "RightFoot" },
+}
+
+local R6_RIG = {
+    { "Head", "Torso" }, { "Torso", "Left Arm" }, { "Torso", "Right Arm" },
+    { "Torso", "Left Leg" }, { "Torso", "Right Leg" },
+}
+
+local function rigOf(rec, now)
+    if rec.rig == nil or (rec.rig == false and now - rec.rigAt > 1) then
+        local model = rec.model
+        if model:FindFirstChild("UpperTorso") then
+            rec.rig = R15_RIG
+        elseif model:FindFirstChild("Torso") then
+            rec.rig = R6_RIG
+        else
+            rec.rig = false
+        end
+        rec.rigAt = now
+    end
+    return rec.rig or nil
+end
+
+local function drawSkeleton(rec, esp, camera, color, alpha, now)
+    local wanted = CONFIG.ESPSkeleton
+    if wanted and not esp.skeleton and not esp.skeletonFailed then
+        if not ensureSkeleton(esp) then
+            esp.skeletonFailed = true
+        end
+    end
+
+    local lines = esp.skeleton
+    if not lines then return end
+
+    local last = 0
+    local rig = wanted and rigOf(rec, now) or nil
+
+    if rig then
+        for index, pair in ipairs(rig) do
+            local line = lines[index]
+            local a = exactPart(rec, pair[1])
+            local b = exactPart(rec, pair[2])
+
+            if line and a and b then
+                local pa = camera:WorldToViewportPoint(a.Position)
+                local pb = camera:WorldToViewportPoint(b.Position)
+                if pa.Z > 0 and pb.Z > 0 then
+                    line.From = Vector2.new(pa.X, pa.Y)
+                    line.To = Vector2.new(pb.X, pb.Y)
+                    line.Color = color
+                    line.Transparency = alpha
+                    line.Visible = true
+                    last = index
+                else
+                    line.Visible = false
+                end
+            elseif line then
+                line.Visible = false
+            end
+        end
+    end
+
+    for index = last + 1, #lines do
+        lines[index].Visible = false
+    end
+end
+
+-- Drawing coordinates match WorldToViewportPoint output (screen pixels).
+local function drawEsp(rec, esp, camera, camPos, viewport, now)
+    local root = partOf(rec, "HumanoidRootPart")
+    if not root or not isAlive(rec) then return false end
+
+    local position = root.Position
+    local distance = (position - camPos).Magnitude
+    if distance > CONFIG.ESPMaxDistance then return false end
+
+    local half = getHeight(rec, now) * 0.5
+    local top = camera:WorldToViewportPoint(position + Vector3.new(0, half, 0))
+    local bottom = camera:WorldToViewportPoint(position - Vector3.new(0, half, 0))
+    if top.Z <= 0 or bottom.Z <= 0 then return false end
+
+    local centerX = (top.X + bottom.X) * 0.5
+    if centerX < -100 or centerX > viewport.X + 100 then return false end
+
+    local height = math.abs(bottom.Y - top.Y)
+    local width = height * CONFIG.ESPBoxAspect
+    local left = centerX - width * 0.5
+    local topY = math.min(top.Y, bottom.Y)
+    local color = entityColor(rec)
+    local alpha = CONFIG.ESPOpacity
+
+    esp.visible = true
+
+    local showBox = CONFIG.ESPBox
+    esp.boxOutline.Visible = showBox
+    esp.box.Visible = showBox
+    if showBox then
+        local boxPosition = Vector2.new(left, topY)
+        local boxSize = Vector2.new(width, height)
+        esp.boxOutline.Position = boxPosition
+        esp.boxOutline.Size = boxSize
+        esp.boxOutline.Transparency = alpha
+        esp.box.Position = boxPosition
+        esp.box.Size = boxSize
+        esp.box.Color = color
+        esp.box.Transparency = alpha
+    end
+
+    local health, maxHealth = healthOf(rec)
+    local showHealth = CONFIG.ESPHealth and health ~= nil and maxHealth ~= nil and maxHealth > 0
+    esp.hpBack.Visible = showHealth
+    esp.hpFill.Visible = showHealth
+    if showHealth then
+        local ratio = math.clamp(health / maxHealth, 0, 1)
+        local barX = left - 6
+        esp.hpBack.Position = Vector2.new(barX - 1, topY - 1)
+        esp.hpBack.Size = Vector2.new(4, height + 2)
+        esp.hpFill.Position = Vector2.new(barX, topY + height * (1 - ratio))
+        esp.hpFill.Size = Vector2.new(2, height * ratio)
+        esp.hpFill.Color = Color3.fromHSV(ratio * 0.33, 1, 1)
+        esp.hpFill.Transparency = alpha
+    end
+
+    local showName = CONFIG.ESPName
+    esp.name.Visible = showName
+    if showName then
+        local label = rec.player and rec.player.DisplayName or rec.model.Name
+        if esp.lastName ~= label then
+            esp.lastName = label
+            esp.name.Text = label
+        end
+        esp.name.Size = CONFIG.ESPTextSize
+        esp.name.Color = color
+        esp.name.Transparency = alpha
+        esp.name.Position = Vector2.new(centerX, topY - CONFIG.ESPTextSize - 3)
+    end
+
+    local showDistance = CONFIG.ESPDistance
+    esp.dist.Visible = showDistance
+    if showDistance then
+        local rounded = math.floor(distance + 0.5)
+        if esp.lastDist ~= rounded then
+            esp.lastDist = rounded
+            esp.dist.Text = tostring(rounded) .. "m"
+        end
+        esp.dist.Size = CONFIG.ESPTextSize
+        esp.dist.Color = color
+        esp.dist.Transparency = alpha
+        esp.dist.Position = Vector2.new(centerX, topY + height + 2)
+    end
+
+    local showTracer = CONFIG.ESPTracer
+    esp.tracer.Visible = showTracer
+    if showTracer then
+        esp.tracer.From = Vector2.new(viewport.X * 0.5, viewport.Y)
+        esp.tracer.To = Vector2.new(centerX, topY + height)
+        esp.tracer.Color = color
+        esp.tracer.Transparency = alpha
+    end
+
+    drawSkeleton(rec, esp, camera, color, alpha, now)
+
+    return true
+end
+
+local espWasActive = false
+
+local function updateEsp(camera)
+    if not CONFIG.ESPEnabled then
+        if espWasActive then
+            espWasActive = false
+            for _, rec in pairs(records) do
+                hideEsp(rec.esp)
+            end
+        end
+        return
+    end
+    espWasActive = true
+
+    local camPos = camera.CFrame.Position
+    local viewport = camera.ViewportSize
+    local now = os.clock()
+    local localTeam = localPlayer.Team
+
+    for _, rec in pairs(records) do
+        local wanted = (rec.kind == "Player" and CONFIG.ESPPlayers)
+            or (rec.kind == "NPC" and CONFIG.ESPNPCs)
+
+        if wanted and rec.kind == "Player" and CONFIG.ESPHideTeammates
+            and localTeam ~= nil and rec.player.Team == localTeam
+        then
+            wanted = false
+        end
+
+        local shown = false
+        if wanted then
+            if not rec.esp then
+                rec.esp = createEsp()
+                if not rec.esp then
+                    CONFIG.ESPEnabled = false
+                    syncControl(espToggle, false)
+                    say("ESP disabled: Drawing object creation failed")
+                    return
+                end
+            end
+            shown = drawEsp(rec, rec.esp, camera, camPos, viewport, now)
+        end
+
+        if not shown then
+            hideEsp(rec.esp)
+        end
+    end
+end
+
+local function radarPoint(offset, forward, right, scale)
+    return offset:Dot(right) * scale, -offset:Dot(forward) * scale
+end
+
+local function updateRadar(camera)
+    if not CONFIG.RadarEnabled then
+        if radarFrame.Visible then
+            radarFrame.Visible = false
+        end
+        return
+    end
+    radarFrame.Visible = true
+
+    local size = CONFIG.RadarSize
+    if radarFrame.Size.X.Offset ~= size then
+        radarFrame.Size = UDim2.fromOffset(size, size)
+    end
+
+    local radius = size * 0.5
+    local scale = radius / math.max(CONFIG.RadarRange, 1)
+
+    local forward
+    if CONFIG.RadarRotate then
+        local look = camera.CFrame.LookVector
+        forward = Vector3.new(look.X, 0, look.Z)
+        forward = forward.Magnitude > 0.01 and forward.Unit or Vector3.new(0, 0, -1)
+    else
+        forward = Vector3.new(0, 0, -1)
+    end
+    local right = forward:Cross(Vector3.yAxis)
+
+    -- North marker follows the camera rotation.
+    local nx, ny = radarPoint(Vector3.new(0, 0, -1), forward, right, 1)
+    radarNorth.Position = UDim2.fromOffset(radius + nx * (radius - 10), radius + ny * (radius - 10))
+
+    local character = localPlayer.Character
+    local selfRoot = character and character:FindFirstChild("HumanoidRootPart")
+    local center = selfRoot and selfRoot:IsA("BasePart") and selfRoot.Position or camera.CFrame.Position
+
+    for rec, dot in pairs(radarDots) do
+        if records[rec.model] ~= rec then
+            dot:Destroy()
+            radarDots[rec] = nil
+        end
+    end
+
+    local limit = radius - 5
+
+    for _, rec in pairs(records) do
+        local root = partOf(rec, "HumanoidRootPart")
+        local dot = radarDots[rec]
+
+        if root and isAlive(rec) then
+            local px, py = radarPoint(root.Position - center, forward, right, scale)
+
+            local magnitude = math.sqrt(px * px + py * py)
+            if magnitude > limit then
+                px = px / magnitude * limit
+                py = py / magnitude * limit
+            end
+
+            if not dot then
+                dot = newInstance("Frame", {
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    Size = UDim2.fromOffset(7, 7),
+                    BorderSizePixel = 0,
+                    ZIndex = 3,
+                }, radarFrame)
+                newInstance("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
+                radarDots[rec] = dot
+            end
+
+            dot.Position = UDim2.fromOffset(radius + px, radius + py)
+            dot.BackgroundColor3 = entityColor(rec)
+            dot.Visible = true
+        elseif dot then
+            dot.Visible = false
+        end
+    end
+end
+
+local hudAt = 0
+
+local function updateHud(valid, camera, now)
+    if not (CONFIG.HudEnabled and valid) then
+        if hud.Visible then
+            hud.Visible = false
+        end
+        return
+    end
+
+    hud.Visible = true
+    if now - hudAt < 0.1 then return end
+    hudAt = now
+
+    local rec = state.target
+    hudName.Text = rec.player and rec.player.DisplayName or rec.model.Name
+    hudDist.Text = math.floor((state.targetPart.Position - camera.CFrame.Position).Magnitude + 0.5) .. " st"
+
+    local health, maxHealth = healthOf(rec)
+    if health and maxHealth and maxHealth > 0 then
+        local ratio = math.clamp(health / maxHealth, 0, 1)
+        hudBarBack.Visible = true
+        hudBarFill.Size = UDim2.fromScale(ratio, 1)
+        hudBarFill.BackgroundColor3 = THEME.Bad:Lerp(THEME.Good, ratio)
+        hudHp.Text = ("%d / %d HP"):format(math.floor(health + 0.5), math.floor(maxHealth + 0.5))
+    else
+        hudBarBack.Visible = false
+        hudHp.Text = health and ("%d HP"):format(math.floor(health + 0.5)) or "No health data"
+    end
+
+    hudBadge.Text = ""
+end
+
+local function onRender(dt)
+    if not state.alive then return end
+    dt = math.clamp(dt, 0, 0.25)
+    local now = os.clock()
+
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        ring.Visible = false
+        arrow.Visible = false
+        return
+    end
+
+    local center = getCenter(camera)
+    ring.Visible = CONFIG.ShowFov
+    if ring.Visible then
+        local diameter = CONFIG.FovRadius * 2
+        ring.Position = UDim2.fromOffset(center.X, center.Y)
+        ring.Size = UDim2.fromOffset(diameter, diameter)
+    end
+
+    local rec, part = state.target, state.targetPart
+    local valid = isAiming()
+        and rec ~= nil
+        and part ~= nil
+        and state.targetCamera == camera
+        and records[rec.model] == rec
+        and part.Parent == rec.model
+
+    if valid and CONFIG.CameraEnabled then
+        local current = camera.CFrame
+        local aimPosition = part.Position + part.AssemblyLinearVelocity * CONFIG.Prediction
+        if (aimPosition - current.Position).Magnitude > 0.001 then
+            local desired = CFrame.lookAt(current.Position, aimPosition)
+            local alpha = 1 - math.exp(-CONFIG.Response * dt)
+            camera.CFrame = current:Lerp(desired, alpha)
+        end
+    end
+
+    updateArrow(dt, camera, valid)
+    updateHud(valid, camera, now)
+    updateEsp(camera)
+    updateRadar(camera)
+    updateCctv(dt)
+end
+
+function shutdown()
+    if not state.alive then return end
+    state.alive = false
+    state.held = false
+    state.toggleAim = false
+    npcToken += 1
+    cctv.sceneToken += 1
+    cctv.terrainToken += 1
+
+    if type(bridge) == "table" and bridge.Installed then
+        bridge.Enabled = false
+        bridge.Camera = nil
+        bridge.Position = nil
+    end
+
+    pcall(RunService.UnbindFromRenderStep, RunService, renderName)
+    disconnectList(state.connections)
+    disconnectList(npcConns)
+    for _, conns in pairs(playerConns) do
+        disconnectList(conns)
+    end
+    table.clear(playerConns)
+
+    for _, rec in pairs(records) do
+        destroyEsp(rec.esp)
+    end
+    table.clear(records)
+
+    overlay:Destroy() -- also removes the monitor, radar, HUD, frustum parts, sky and every clone
+
+    if window and not state.windowGone and window.Destroyed ~= true then
+        window:Destroy()
+    end
+
+    if env.FORGE_SESSION == state then
+        env.FORGE_SESSION = nil
+    end
+end
+
+state.Shutdown = shutdown
+env.FORGE_SESSION = state
+
+if type(window.Events) == "table" and window.Events.Destroying
+    and type(window.Events.Destroying.Connect) == "function"
+then
+    connect(window.Events.Destroying, function()
+        state.windowGone = true
+        shutdown()
+    end)
+end
+
+RunService:BindToRenderStep(renderName, Enum.RenderPriority.Camera.Value + 1, onRender)
+
+if CONFIG.AutoLoadConfig then
+    loadConfig()
+end
+if CONFIG.DexAutoload then
+    loadDex()
+end
+
+say("FORGE ready. Hold " .. CONFIG.AimInput .. " to aim; " .. CONFIG.MenuKey .. " toggles the menu; " .. CONFIG.PanicKey .. " unloads.")
