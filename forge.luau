@@ -101,6 +101,8 @@ local CONFIG = {
 
     -- CCTV monitor
     CCTVEnabled = false,
+    CCTVSource = "Target", -- "Target" or "Self"
+    CCTVShowLocation = true,
     CCTVSmoothTerrain = true,
     CCTVSceneTracking = true,
     CCTVMode = "Behind",         -- "Behind", "Front", "Overhead", "Orbit"
@@ -6377,53 +6379,79 @@ local hud = newInstance("Frame", {
     Name = "TargetHud",
     AnchorPoint = Vector2.new(0.5, 0),
     Position = UDim2.new(0.5, 0, 0, 56),
-    Size = UDim2.fromOffset(268, 60),
-    BackgroundColor3 = THEME.Panel,
-    BackgroundTransparency = 0.1,
-    BorderSizePixel = 0,
+    Size = UDim2.fromOffset(300, 92),
+    BackgroundColor3 = X64UI.Theme.Background,
+    BorderColor3 = X64UI.Theme.Border,
+    BorderSizePixel = 1,
     Visible = false,
 }, overlay)
-local hudStroke = styleFrame(hud, 10, THEME.Stroke)
+local hudInfo = {}
+hudInfo.header = newInstance("Frame", {
+    Size = UDim2.new(1, 0, 0, 22),
+    BackgroundColor3 = X64UI.Theme.TitleBar,
+    BorderSizePixel = 0,
+}, hud)
+hudInfo.title = newLabel(hudInfo.header, {
+    Position = UDim2.fromOffset(7, 0),
+    Size = UDim2.new(1, -14, 1, 0),
+    Font = Enum.Font.Code,
+    Text = "TARGET PROFILE",
+    TextSize = 13,
+    TextColor3 = X64UI.Theme.AccentText,
+})
+hudInfo.kind = newLabel(hudInfo.header, {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -7, 0, 0),
+    Size = UDim2.fromOffset(72, 22),
+    Font = Enum.Font.Code,
+    TextSize = 12,
+    TextColor3 = X64UI.Theme.Dim,
+    TextXAlignment = Enum.TextXAlignment.Right,
+})
 
 local hudName = newLabel(hud, {
-    Position = UDim2.fromOffset(12, 8),
-    Size = UDim2.new(1, -92, 0, 16),
-    Font = THEME.FontBold,
+    Position = UDim2.fromOffset(8, 29),
+    Size = UDim2.new(1, -92, 0, 17),
+    Font = Enum.Font.Code,
     TextSize = 14,
+    TextColor3 = X64UI.Theme.Text,
     TextTruncate = Enum.TextTruncate.AtEnd,
 })
 local hudDist = newLabel(hud, {
     AnchorPoint = Vector2.new(1, 0),
-    Position = UDim2.new(1, -12, 0, 9),
-    Size = UDim2.fromOffset(72, 14),
-    TextColor3 = THEME.Muted,
+    Position = UDim2.new(1, -8, 0, 30),
+    Size = UDim2.fromOffset(80, 16),
+    Font = Enum.Font.Code,
+    TextSize = 12,
+    TextColor3 = X64UI.Theme.Dim,
     TextXAlignment = Enum.TextXAlignment.Right,
 })
 local hudBarBack = newInstance("Frame", {
-    Position = UDim2.fromOffset(12, 31),
-    Size = UDim2.new(1, -24, 0, 6),
-    BackgroundColor3 = THEME.PanelAlt,
+    Position = UDim2.fromOffset(8, 75),
+    Size = UDim2.new(1, -16, 0, 7),
+    BackgroundColor3 = X64UI.Theme.PanelAlt,
     BorderSizePixel = 0,
 }, hud)
-styleFrame(hudBarBack, 3)
 local hudBarFill = newInstance("Frame", {
     Size = UDim2.fromScale(1, 1),
-    BackgroundColor3 = THEME.Good,
+    BackgroundColor3 = X64UI.Theme.Accent,
     BorderSizePixel = 0,
 }, hudBarBack)
-styleFrame(hudBarFill, 3)
 local hudHp = newLabel(hud, {
-    Position = UDim2.fromOffset(12, 41),
-    Size = UDim2.new(0.5, 0, 0, 14),
-    TextColor3 = THEME.Muted,
-    TextSize = 11,
+    Position = UDim2.fromOffset(8, 53),
+    Size = UDim2.new(0.6, 0, 0, 16),
+    Font = Enum.Font.Code,
+    TextColor3 = X64UI.Theme.Text,
+    TextSize = 12,
 })
 local hudBadge = newLabel(hud, {
     AnchorPoint = Vector2.new(1, 0),
-    Position = UDim2.new(1, -12, 0, 41),
-    Size = UDim2.fromOffset(130, 14),
-    Font = THEME.FontBold,
-    TextSize = 11,
+    Position = UDim2.new(1, -8, 0, 53),
+    Size = UDim2.fromOffset(100, 16),
+    Font = Enum.Font.Code,
+    TextColor3 = X64UI.Theme.Dim,
+    TextSize = 12,
+    TextTruncate = Enum.TextTruncate.AtEnd,
     TextXAlignment = Enum.TextXAlignment.Right,
 })
 
@@ -6536,6 +6564,9 @@ cctv = {
     closing = false,
     dismissed = nil,
     flash = 0,
+    selfRecord = nil,
+    selfDismissed = false,
+    locationAt = 0,
 }
 
 cctvFrame = newInstance("Frame", {
@@ -6590,6 +6621,22 @@ local feed = newInstance("ViewportFrame", {
 
 local feedCamera = newInstance("Camera", { FieldOfView = CONFIG.CCTVFov }, feed)
 feed.CurrentCamera = feedCamera
+
+local locationLabel = newLabel(viewArea, {
+    Name = "SelfLocation",
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.new(0, 8, 1, -8),
+    Size = UDim2.new(1, -36, 0, 20),
+    BackgroundColor3 = X64UI.Theme.Background,
+    BackgroundTransparency = 0.2,
+    Font = Enum.Font.Code,
+    TextSize = 13,
+    TextColor3 = X64UI.Theme.Text,
+    TextStrokeTransparency = 0.4,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    ZIndex = 8,
+    Visible = false,
+})
 
 local noSignal = newInstance("Frame", {
     Size = FULL,
@@ -7378,6 +7425,9 @@ function closeCctv(manual)
     if not cctv.rec then return end
     if manual then
         cctv.dismissed = cctv.rec
+        if CONFIG.CCTVSource == "Self" then
+            cctv.selfDismissed = true
+        end
     end
     cctv.closing = true
 end
@@ -7468,7 +7518,10 @@ function updateCctv(dt)
     local rec = cctv.rec
     if not rec or not wantOpen then return end -- closing: the last frame stays frozen
 
-    local root = records[rec.model] == rec and isAlive(rec) and partOf(rec, "HumanoidRootPart") or nil
+    local registered = records[rec.model] == rec
+        or (rec == cctv.selfRecord and rec.model == localPlayer.Character)
+    local root = registered and rec.model:IsDescendantOf(Workspace)
+        and isAlive(rec) and partOf(rec, "HumanoidRootPart") or nil
     if not root then
         cctv.lostAt = cctv.lostAt or now
         noSignal.Visible = true
@@ -7491,7 +7544,7 @@ function updateCctv(dt)
     end
 
     local character = localPlayer.Character
-    if CONFIG.CCTVShowSelf and character then
+    if CONFIG.CCTVShowSelf and character and rec.model ~= character then
         if cctv.selfFor ~= character then
             cctv.selfFor = character
             destroyLive(cctv.selfLive)
@@ -7561,6 +7614,17 @@ function updateCctv(dt)
     feedCamera.CFrame = cctv.camCF
     feedCamera.FieldOfView = fovValue
     feed.BackgroundColor3 = CONFIG.CCTVBackground
+    locationLabel.Visible = CONFIG.CCTVShowLocation
+    if locationLabel.Visible and now - cctv.locationAt >= 0.2 then
+        cctv.locationAt = now
+        local selfRoot = character and character:FindFirstChild("HumanoidRootPart")
+        if selfRoot and selfRoot:IsA("BasePart") and selfRoot:IsDescendantOf(Workspace) then
+            local p = selfRoot.Position
+            locationLabel.Text = (" SELF  X %+.0f  Y %+.0f  Z %+.0f"):format(p.X, p.Y, p.Z)
+        else
+            locationLabel.Text = " SELF  LOCATION UNAVAILABLE"
+        end
+    end
 
     -- World streaming
     if not cctv.sceneBusy and not cctv.terrainBusy and (
@@ -7709,6 +7773,9 @@ end
 
 local function setCctv(value, fromUi)
     CONFIG.CCTVEnabled = value == true
+    if CONFIG.CCTVEnabled then
+        cctv.selfDismissed = false
+    end
     state.selectElapsed = math.huge
     if not fromUi then syncControl(cctvToggle, CONFIG.CCTVEnabled) end
 end
@@ -8049,9 +8116,15 @@ cctvToggle = cctvGroup:AddToggle("forge_cctv", {
         setCctv(value, true)
     end,
 })
-cctvGroup:AddLabel("Hold the aim input to select a target. The feed stays open after release. Drag the screen to move it; drag the bottom-right corner to resize.", true)
+cctvGroup:AddLabel("Target follows your selection; Self follows your character. Drag the screen to move it or the corner to resize.", true)
+addDropdown(cctvGroup, "forge_cctv_source", "Feed source", "CCTVSource", { "Target", "Self" }, function()
+    cctv.selfDismissed = false
+    cctv.dismissed = nil
+    if cctv.rec then closeCctv(false) end
+end)
 addToggle(cctvGroup, "forge_cctv_pin", "Pin feed", "CCTVPin")
 addToggle(cctvGroup, "forge_cctv_self", "Show my character", "CCTVShowSelf")
+addToggle(cctvGroup, "forge_cctv_location", "Show my coordinates", "CCTVShowLocation")
 addSlider(cctvGroup, "forge_cctv_open", "Power-on time", "CCTVOpenSeconds", 0.1, 1.5, 2, " s")
 cctvGroup:AddButton({
     Text = "Reset window",
@@ -8185,6 +8258,26 @@ connect(RunService.Heartbeat, function(dt)
     end
 
     updateVisibility(os.clock())
+    if CONFIG.CCTVEnabled and CONFIG.CCTVSource == "Self" then
+        local character = localPlayer.Character
+        if character and character:IsDescendantOf(Workspace) then
+            if not cctv.selfRecord or cctv.selfRecord.model ~= character then
+                cctv.selfRecord = {
+                    model = character, kind = "Player", player = localPlayer,
+                    parts = {}, exact = {}, height = 5, heightAt = -math.huge,
+                }
+                cctv.selfDismissed = false
+            end
+            local root = partOf(cctv.selfRecord, "HumanoidRootPart")
+            if not cctv.selfDismissed and root and isAlive(cctv.selfRecord)
+                and (cctv.rec ~= cctv.selfRecord or cctv.closing) then
+                switchCctv(cctv.selfRecord)
+            end
+        elseif cctv.rec == cctv.selfRecord and cctv.rec then
+            closeCctv(false)
+            cctv.selfRecord = nil
+        end
+    end
     -- CCTV cloning and world bookkeeping do not belong in the render callback.
     updateCctv(math.clamp(dt, 0, 0.25))
 
@@ -8224,7 +8317,7 @@ connect(RunService.Heartbeat, function(dt)
     if aimed ~= cctv.dismissed then
         cctv.dismissed = nil
     end
-    if CONFIG.CCTVEnabled and aimed and aimed ~= cctv.dismissed then
+    if CONFIG.CCTVEnabled and CONFIG.CCTVSource == "Target" and aimed and aimed ~= cctv.dismissed then
         local pinned = CONFIG.CCTVPin and cctv.rec ~= nil and not cctv.closing
         if (cctv.rec ~= aimed or cctv.closing) and not pinned then
             switchCctv(aimed)
@@ -8620,26 +8713,27 @@ local function updateHud(valid, camera, now)
     end
 
     hud.Visible = true
-    if now - hudAt < 0.1 then return end
+    if state.target == hudInfo.record and now - hudAt < 0.1 then return end
     hudAt = now
 
     local rec = state.target
+    hudInfo.record = rec
     hudName.Text = rec.player and rec.player.DisplayName or rec.model.Name
     hudDist.Text = math.floor((state.targetPart.Position - camera.CFrame.Position).Magnitude + 0.5) .. " st"
+    hudInfo.kind.Text = rec.kind == "Player" and "PLAYER" or "NPC"
 
     local health, maxHealth = healthOf(rec)
     if health and maxHealth and maxHealth > 0 then
         local ratio = math.clamp(health / maxHealth, 0, 1)
         hudBarBack.Visible = true
         hudBarFill.Size = UDim2.fromScale(ratio, 1)
-        hudBarFill.BackgroundColor3 = THEME.Bad:Lerp(THEME.Good, ratio)
-        hudHp.Text = ("%d / %d HP"):format(math.floor(health + 0.5), math.floor(maxHealth + 0.5))
+        hudBarFill.BackgroundColor3 = ratio <= 0.25 and X64UI.Theme.Bad or X64UI.Theme.Accent
+        hudHp.Text = ("HEALTH  %d / %d"):format(math.floor(health + 0.5), math.floor(maxHealth + 0.5))
     else
         hudBarBack.Visible = false
-        hudHp.Text = health and ("%d HP"):format(math.floor(health + 0.5)) or "No health data"
+        hudHp.Text = health and ("HEALTH  %d"):format(math.floor(health + 0.5)) or "HEALTH  --"
     end
-
-    hudBadge.Text = ""
+    hudBadge.Text = rec.player and ("@" .. rec.player.Name) or "MODEL"
 end
 
 local function onRender(dt)
